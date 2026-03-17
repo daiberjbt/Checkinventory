@@ -1,0 +1,53 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile and role information",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string", "format": "email" },
+        "role": { "type": "string", "enum": ["admin", "dependent"] },
+        "adminEmail": { "type": "string", "format": "email", "description": "Email of the admin if role is dependent" }
+      },
+      "required": ["email", "role"]
+    },
+    "Inventory": {
+      "title": "Inventory",
+      "description": "Property inventory record",
+      "type": "object",
+      "properties": {
+        "propertyName": { "type": "string" },
+        "address": { "type": "string" },
+        "date": { "type": "string" },
+        "status": { "type": "string", "enum": ["draft", "completed"] },
+        "createdBy": { "type": "string", "description": "UID of the user who created it" },
+        "adminEmail": { "type": "string", "description": "Email of the admin responsible for this inventory" },
+        "annexes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string" },
+              "text": { "type": "string" },
+              "photos": { "type": "array" },
+              "createdAt": { "type": "number" },
+              "createdBy": { "type": "string" },
+              "creatorName": { "type": "string" }
+            }
+          }
+        }
+      },
+      "required": ["propertyName", "address", "date", "status", "createdBy"]
+    }
+  },
+  "firestore": {
+    "users/{userId}": {
+      "schema": "User",
+      "description": "User profiles"
+    },
+    "inventories/{inventoryId}": {
+      "schema": "Inventory",
+      "description": "Inventory records"
+    }
+  }
+}

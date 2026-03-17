@@ -1,0 +1,136 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users
+    // Document ID: {userId} (Firebase Auth UID)
+    // Fields:
+    //   - email: string (required)
+    //   - role: string (required, 'admin' | 'dependent')
+    //   - adminEmail: string (optional, required if role is 'dependent')
+    //   - createdAt: string (required, ISO 8601)
+    //
+    // Collection: inventories
+    // Document ID: {inventoryId} (UUID)
+    // Fields:
+    //   - propertyName: string (required, size < 200)
+    //   - address: string (required, size < 500)
+    //   - neighborhood: string (optional, size < 200)
+    //   - rentValue: string (optional, size < 100)
+    //   - internalCode: string (optional, size < 100)
+    //   - ownerName: string (optional, size < 200)
+    //   - tenantName: string (optional, size < 200)
+    //   - date: string (required, ISO 8601)
+    //   - spaces: list (required, size < 50)
+    //   - createdAt: number (required)
+    //   - status: string (required, 'draft' | 'completed')
+    //   - ownerSignature: string (optional, dataUrl)
+    //   - tenantSignature: string (optional, dataUrl)
+    //   - createdBy: string (required, UID)
+    //   - adminEmail: string (required, email)
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && 
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
+         (request.auth.token.email == "djbtorreglosa@gmail.com" && request.auth.token.email_verified == true));
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isValidUser(data) {
+      return data.keys().hasOnly(['email', 'role', 'adminEmail', 'createdAt', 'firstName', 'lastName']) &&
+             data.email is string &&
+             data.role in ['admin', 'dependent'] &&
+             (data.role == 'admin' || data.adminEmail is string) &&
+             data.createdAt is string &&
+             data.firstName is string &&
+             data.lastName is string;
+    }
+
+    function isValidInventory(data) {
+      return data.propertyName is string && data.propertyName.size() < 200 &&
+             data.address is string && data.address.size() < 500 &&
+             data.date is string &&
+             data.status in ['draft', 'completed'] &&
+             data.createdBy is string &&
+             data.adminEmail is string &&
+             data.createdAt is number &&
+             data.spaces is list &&
+             (!('annexes' in data) || data.annexes is list) &&
+             (!('creatorName' in data) || data.creatorName is string);
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow create: if isAuthenticated() && isOwner(userId) && isValidUser(request.resource.data);
+      allow update: if isAuthenticated() && isOwner(userId) && isValidUser(request.resource.data) && 
+                    request.resource.data.role == resource.data.role;
+    }
+
+    match /inventories/{inventoryId} {
+      // Allow public GET for completed inventories (for PDF photo download)
+      allow get: if resource.data.status == 'completed';
+      
+      // Admins can read inventories where they are the adminEmail
+      // Dependents can read inventories they created
+      allow list: if isAuthenticated() && 
+                  (request.auth.uid == resource.data.createdBy || 
+                   getUserData().email == resource.data.adminEmail);
+      
+      // Authenticated get for non-completed or owned inventories
+      allow get: if isAuthenticated() && 
+                  (request.auth.uid == resource.data.createdBy || 
+                   getUserData().email == resource.data.adminEmail);
+      
+      allow create: if isAuthenticated() && 
+                    isValidInventory(request.resource.data) &&
+                    request.resource.data.createdBy == request.auth.uid &&
+                    (getUserData().role == 'admin' ? 
+                      request.resource.data.adminEmail == getUserData().email : 
+                      request.resource.data.adminEmail == getUserData().adminEmail);
+      
+      allow update: if isAuthenticated() && 
+                    isValidInventory(request.resource.data) &&
+                    (request.auth.uid == resource.data.createdBy || 
+                     getUserData().email == resource.data.adminEmail) &&
+                    request.resource.data.createdBy == resource.data.createdBy &&
+                    request.resource.data.adminEmail == resource.data.adminEmail &&
+                    (resource.data.status == 'draft' || 
+                     (resource.data.status == 'completed' && 
+                      request.resource.data.diff(resource.data).affectedKeys().hasOnly(['annexes'])));
+      
+      allow delete: if isAuthenticated() && 
+                    (request.auth.uid == resource.data.createdBy || 
+                     getUserData().email == resource.data.adminEmail);
+    }
+
+    match /test/connection {
+      allow read: if true;
+    }
+  }
+}

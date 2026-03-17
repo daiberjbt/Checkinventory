@@ -1,0 +1,5 @@
+{
+  "name": "CheckInventory",
+  "description": "Aplicación para el registro detallado del estado de inmuebles en renta, con soporte fotográfico y exportación de reportes.",
+  "requestFramePermissions": ["camera", "microphone"]
+}
