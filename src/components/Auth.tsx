@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { motion } from 'motion/react';
 import { Mail, Lock, Shield, Users, ArrowRight, User as UserIcon } from 'lucide-react';
 import { auth, db } from '../firebase';
+import { webOrigin } from '../native';
 import { 
   createUserWithEmailAndPassword, 
   signInWithEmailAndPassword,
@@ -33,7 +34,7 @@ export const Auth: React.FC = () => {
 
     try {
       await sendPasswordResetEmail(auth, email, {
-        url: window.location.origin,
+        url: webOrigin(),
       });
       setSuccessMessage('Se ha enviado un correo para restablecer tu contraseña. Por favor revisa tu bandeja de entrada.');
       setIsForgotPassword(false);
@@ -91,7 +92,7 @@ export const Auth: React.FC = () => {
 
         // Send verification email
         await sendEmailVerification(user, {
-          url: window.location.origin,
+          url: webOrigin(),
           handleCodeInApp: false,
         });
 
