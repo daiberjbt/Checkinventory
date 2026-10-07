@@ -1,11 +1,29 @@
 <!doctype html>
-<html lang="en">
+<html lang="es">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>My Google AI Studio App</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="theme-color" content="#000000" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="CheckInventory" />
+    <link rel="manifest" href="/manifest.json" />
+    <title>CheckInventory - Inventarios Digitales</title>
+    <script>
+      (function() {
+        try {
+          var saved = localStorage.getItem('checkinventory_theme');
+          var prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+          if (saved === 'dark' || (!saved && prefersDark)) {
+            document.documentElement.classList.add('dark');
+            if (document.body) document.body.classList.add('dark');
+          }
+        } catch(e) {}
+      })();
+    </script>
   </head>
-  <body>
+  <body class="bg-[#f8f9fa] antialiased select-none sm:select-auto">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

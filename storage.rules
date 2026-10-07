@@ -1,0 +1,78 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    
+    // ===============================================================
+    // Funciones Auxiliares de Seguridad Multi-Tenant
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isSuperAdmin() {
+      return isAuthenticated() && 
+        (request.auth.token.get('email', '') == "djbtorreglosa@gmail.com" || 
+         request.auth.token.get('isSuperAdmin', false) == true);
+    }
+
+    // Valida pertenencia al Tenant mediante Custom Claim adminUid o UID directo del Admin
+    function isMemberOfTenant(adminUid) {
+      return isAuthenticated() && 
+        (request.auth.token.get('adminUid', '') == adminUid || 
+         request.auth.uid == adminUid);
+    }
+
+    // Validación de tipo de medio y tamaño máximo (15 MB)
+    function isValidMediaUpload() {
+      return request.resource.size > 0 &&
+             request.resource.size <= 15 * 1024 * 1024 &&
+             (request.resource.contentType.matches('image/(jpeg|png|webp|jpg)') || 
+              request.resource.contentType == 'application/pdf');
+    }
+
+    // ===============================================================
+    // 1. ÁREA MULTI-TENANT: tenants/{adminUid}/photos/{userId}/{fileName}
+    // ===============================================================
+    match /tenants/{adminUid}/photos/{userId}/{fileName} {
+      // LECTURA: SuperAdmin o cualquier miembro acreditado del mismo tenant
+      allow read: if isSuperAdmin() || isMemberOfTenant(adminUid);
+      
+      // ESCRITURA: Subida permitida al propio usuario acreditado bajo su propio tenant
+      allow write: if (isSuperAdmin() || (isMemberOfTenant(adminUid) && request.auth.uid == userId)) && 
+                      isValidMediaUpload();
+      
+      // ELIMINACIÓN: Administrador de la agencia titular, creador de la foto o SuperAdmin
+      allow delete: if isSuperAdmin() || 
+                       request.auth.uid == adminUid || 
+                       (isMemberOfTenant(adminUid) && request.auth.uid == userId);
+    }
+
+    // ===============================================================
+    // 2. ÁREA DE LOGOS DE AGENCIA: tenants/{adminUid}/logos/{fileName}
+    // ===============================================================
+    match /tenants/{adminUid}/logos/{fileName} {
+      // LECTURA: Restringida exclusivamente a miembros del tenant correspondiente
+      allow read: if isSuperAdmin() || isMemberOfTenant(adminUid);
+      
+      // ESCRITURA Y BORRADO: Exclusivo del Administrador titular de la agencia o SuperAdmin
+      allow write, delete: if isSuperAdmin() || request.auth.uid == adminUid;
+    }
+
+    // ===============================================================
+    // 3. FOTOGRAFÍAS LEGACY: photos/{userId}/{fileName}
+    // ===============================================================
+    match /photos/{userId}/{fileName} {
+      // LECTURA: Solo el creador original o SuperAdmin (NUNCA global / público)
+      allow read: if isSuperAdmin() || (isAuthenticated() && request.auth.uid == userId);
+      // ESCRITURA: Bloqueada para forzar que toda nueva subida use /tenants/
+      allow write: if false;
+      // ELIMINACIÓN: Creador original o SuperAdmin
+      allow delete: if isSuperAdmin() || (isAuthenticated() && request.auth.uid == userId);
+    }
+
+    // Denegación total por defecto
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

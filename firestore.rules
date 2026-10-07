@@ -4,44 +4,15 @@ service cloud.firestore {
   match /databases/{database}/documents {
     
     // ===============================================================
-    // Assumed Data Model
-    // ===============================================================
-    //
-    // Collection: users
-    // Document ID: {userId} (Firebase Auth UID)
-    // Fields:
-    //   - email: string (required)
-    //   - role: string (required, 'admin' | 'dependent')
-    //   - adminEmail: string (optional, required if role is 'dependent')
-    //   - createdAt: string (required, ISO 8601)
-    //
-    // Collection: inventories
-    // Document ID: {inventoryId} (UUID)
-    // Fields:
-    //   - propertyName: string (required, size < 200)
-    //   - address: string (required, size < 500)
-    //   - neighborhood: string (optional, size < 200)
-    //   - rentValue: string (optional, size < 100)
-    //   - internalCode: string (optional, size < 100)
-    //   - ownerName: string (optional, size < 200)
-    //   - tenantName: string (optional, size < 200)
-    //   - date: string (required, ISO 8601)
-    //   - spaces: list (required, size < 50)
-    //   - createdAt: number (required)
-    //   - status: string (required, 'draft' | 'completed')
-    //   - ownerSignature: string (optional, dataUrl)
-    //   - tenantSignature: string (optional, dataUrl)
-    //   - createdBy: string (required, UID)
-    //   - adminEmail: string (required, email)
-    //
-    // ===============================================================
-
-    // ===============================================================
     // Helper Functions
     // ===============================================================
     
     function isAuthenticated() {
       return request.auth != null;
+    }
+
+    function isSuperAdmin() {
+      return isAuthenticated() && request.auth.token.get('email', '') == "djbtorreglosa@gmail.com";
     }
 
     function isOwner(userId) {
@@ -50,83 +21,285 @@ service cloud.firestore {
 
     function isAdmin() {
       return isAuthenticated() && 
-        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
-         (request.auth.token.email == "djbtorreglosa@gmail.com" && request.auth.token.email_verified == true));
+        (isSuperAdmin() || 
+         (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('role', 'admin') == 'admin'));
     }
 
-    function getUserData() {
-      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    function isUserActive() {
+      return isAuthenticated() && 
+             (!exists(/databases/$(database)/documents/users/$(request.auth.uid)) || 
+              (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('isActive', true) != false &&
+               get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('isDeleted', false) != true));
+    }
+
+    function isDependentOf(adminEmail) {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+             (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('adminEmail', '') == adminEmail ||
+              get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('email', '') == adminEmail);
+    }
+
+    function isUserInSameAgency(adminEmail, creatorUid) {
+      return request.auth.uid == creatorUid ||
+             request.auth.token.get('email', '') == adminEmail ||
+             isDependentOf(adminEmail) ||
+             (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+              (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('adminUid', '') == creatorUid ||
+               get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('adminEmail', '') == adminEmail));
     }
 
     function isValidUser(data) {
-      return data.keys().hasOnly(['email', 'role', 'adminEmail', 'createdAt', 'firstName', 'lastName']) &&
-             data.email is string &&
-             data.role in ['admin', 'dependent'] &&
-             (data.role == 'admin' || data.adminEmail is string) &&
-             data.createdAt is string &&
-             data.firstName is string &&
-             data.lastName is string;
+      return (!('email' in data) || (data.email is string && data.email.size() > 3 && data.email.size() < 255)) &&
+             (!('role' in data) || data.role in ['admin', 'dependent']) &&
+             (!('adminEmail' in data) || data.adminEmail == null || (data.adminEmail is string && data.adminEmail.size() < 255)) &&
+             (!('adminUid' in data) || data.adminUid == null || (data.adminUid is string && data.adminUid.size() <= 128)) &&
+             (!('adminName' in data) || data.adminName == null || (data.adminName is string && data.adminName.size() < 200)) &&
+             (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() < 100) || (data.createdAt is number || data.createdAt is int)) &&
+             (!('firstName' in data) || (data.firstName is string && data.firstName.size() < 100)) &&
+             (!('lastName' in data) || (data.lastName is string && data.lastName.size() < 100)) &&
+             (!('hasSeenOnboarding' in data) || data.hasSeenOnboarding is bool) &&
+             (!('isPremium' in data) || data.isPremium is bool) &&
+             (!('plan' in data) || data.plan == null || (data.plan is string && data.plan.size() < 50)) &&
+             (!('expirationDate' in data) || data.expirationDate == null || (data.expirationDate is string && data.expirationDate.size() < 100)) &&
+             (!('licenseCode' in data) || data.licenseCode == null || (data.licenseCode is string && data.licenseCode.size() < 100)) &&
+             (!('isActive' in data) || data.isActive is bool) &&
+             (!('isDeleted' in data) || data.isDeleted is bool) &&
+             (!('id' in data) || (data.id is string && data.id.size() < 100)) &&
+             (!('agencyLogo' in data) || data.agencyLogo == null || (data.agencyLogo is string && data.agencyLogo.size() < 2000000)) &&
+             (!('agencyName' in data) || data.agencyName == null || (data.agencyName is string && data.agencyName.size() < 200)) &&
+             (!('themePreference' in data) || data.themePreference == null || data.themePreference in ['light', 'dark', 'system']) &&
+             (!('isDarkMode' in data) || data.isDarkMode is bool) &&
+             (!('updatedAt' in data) || (data.updatedAt is number || data.updatedAt is int) || (data.updatedAt is string && data.updatedAt.size() < 100)) &&
+             (!('ownerTemplate' in data) || (data.ownerTemplate is string && data.ownerTemplate.size() < 100000)) &&
+             (!('tenantTemplate' in data) || (data.tenantTemplate is string && data.tenantTemplate.size() < 100000));
+    }
+
+    function isValidLicense(data) {
+      return data.keys().hasOnly(['code', 'isUsed', 'expiresAt', 'assignedTo', 'assignedEmail', 'activatedAt', 'durationMonths', 'createdAt', 'createdBy', 'id']) &&
+             data.code is string &&
+             data.isUsed is bool &&
+             (!('expiresAt' in data) || data.expiresAt == null || data.expiresAt is string) &&
+             (!('assignedTo' in data) || data.assignedTo == null || data.assignedTo is string) &&
+             (!('assignedEmail' in data) || data.assignedEmail == null || data.assignedEmail is string) &&
+             (!('activatedAt' in data) || data.activatedAt == null || data.activatedAt is string) &&
+             (!('durationMonths' in data) || (data.durationMonths is number || data.durationMonths is int)) &&
+             (!('createdAt' in data) || data.createdAt is string) &&
+             (!('createdBy' in data) || data.createdBy is string) &&
+             (!('id' in data) || data.id is string);
+    }
+
+    function isValidTemplate(data) {
+      return data.keys().hasAll(['templateName', 'propertyType', 'createdBy', 'createdAt', 'structure']) &&
+             data.keys().hasOnly(['templateName', 'propertyType', 'createdBy', 'createdAt', 'structure', 'id']) &&
+             data.templateName is string && data.templateName.size() > 0 && data.templateName.size() < 100 &&
+             data.propertyType in ['Apartamento', 'Oficina', 'Local', 'Bodega', 'Casa', 'Otro'] &&
+             data.createdBy is string &&
+             (data.createdAt is number || data.createdAt is int) &&
+             data.structure is list &&
+             (!('id' in data) || data.id is string);
     }
 
     function isValidInventory(data) {
-      return data.propertyName is string && data.propertyName.size() < 200 &&
+      return data.keys().hasAll(['propertyName', 'address', 'date', 'status', 'createdBy', 'adminEmail', 'createdAt', 'spaces']) &&
+             data.propertyName is string && data.propertyName.size() < 200 &&
              data.address is string && data.address.size() < 500 &&
              data.date is string &&
-             data.status in ['draft', 'completed'] &&
-             data.createdBy is string &&
-             data.adminEmail is string &&
-             data.createdAt is number &&
-             data.spaces is list &&
-             (!('annexes' in data) || data.annexes is list) &&
-             (!('creatorName' in data) || data.creatorName is string);
+             data.status in ['draft', 'completed', 'archived'] &&
+             data.createdBy is string && data.createdBy.size() > 0 && data.createdBy.size() < 128 &&
+             data.adminEmail is string && data.adminEmail.size() > 0 && data.adminEmail.size() < 255 &&
+             (data.createdAt is number || data.createdAt is int || (data.createdAt is string && data.createdAt.size() < 100)) &&
+             data.spaces is list && data.spaces.size() < 200 &&
+             (!('creatorName' in data) || data.creatorName == null || (data.creatorName is string && data.creatorName.size() < 200)) &&
+             (!('propertyType' in data) || data.propertyType == null || (data.propertyType is string && data.propertyType.size() < 100)) &&
+             (!('customPropertyType' in data) || data.customPropertyType == null || (data.customPropertyType is string && data.customPropertyType.size() < 100)) &&
+             (!('neighborhood' in data) || data.neighborhood == null || (data.neighborhood is string && data.neighborhood.size() < 200)) &&
+             (!('rentValue' in data) || data.rentValue == null || (data.rentValue is string && data.rentValue.size() < 100)) &&
+             (!('internalCode' in data) || data.internalCode == null || (data.internalCode is string && data.internalCode.size() < 100)) &&
+             (!('ownerName' in data) || data.ownerName == null || (data.ownerName is string && data.ownerName.size() < 200)) &&
+             (!('ownerEmail' in data) || data.ownerEmail == null || (data.ownerEmail is string && data.ownerEmail.size() < 255)) &&
+             (!('tenantName' in data) || data.tenantName == null || (data.tenantName is string && data.tenantName.size() < 200)) &&
+             (!('tenantEmail' in data) || data.tenantEmail == null || (data.tenantEmail is string && data.tenantEmail.size() < 255)) &&
+             (!('id' in data) || data.id == null || (data.id is string && data.id.size() < 128)) &&
+             (!('annexes' in data) || data.annexes == null || (data.annexes is list && data.annexes.size() < 200)) &&
+             (!('ownerSignature' in data) || data.ownerSignature == null || (data.ownerSignature is string && data.ownerSignature.size() < 2000000)) &&
+             (!('tenantSignature' in data) || data.tenantSignature == null || (data.tenantSignature is string && data.tenantSignature.size() < 2000000)) &&
+             (!('tenantReceiveSignature' in data) || data.tenantReceiveSignature == null || (data.tenantReceiveSignature is string && data.tenantReceiveSignature.size() < 2000000)) &&
+             (!('ownerDeliverySignature' in data) || data.ownerDeliverySignature == null || (data.ownerDeliverySignature is string && data.ownerDeliverySignature.size() < 2000000)) &&
+             (!('tenantReceiveDate' in data) || data.tenantReceiveDate == null || (data.tenantReceiveDate is string && data.tenantReceiveDate.size() < 100)) &&
+             (!('ownerDeliveryDate' in data) || data.ownerDeliveryDate == null || (data.ownerDeliveryDate is string && data.ownerDeliveryDate.size() < 100)) &&
+             (!('tenantReceiveText' in data) || data.tenantReceiveText == null || (data.tenantReceiveText is string && data.tenantReceiveText.size() < 100000)) &&
+             (!('ownerDeliveryText' in data) || data.ownerDeliveryText == null || (data.ownerDeliveryText is string && data.ownerDeliveryText.size() < 100000)) &&
+             (!('remoteSigningTokens' in data) || data.remoteSigningTokens == null || data.remoteSigningTokens is map) &&
+             (!('ownerRemoteSigned' in data) || data.ownerRemoteSigned == null || data.ownerRemoteSigned is bool) &&
+             (!('tenantRemoteSigned' in data) || data.tenantRemoteSigned == null || data.tenantRemoteSigned is bool) &&
+             (!('ownerSignedActSent' in data) || data.ownerSignedActSent == null || data.ownerSignedActSent is bool) &&
+             (!('tenantSignedActSent' in data) || data.tenantSignedActSent == null || data.tenantSignedActSent is bool) &&
+             (!('updatedAt' in data) || data.updatedAt == null || (data.updatedAt is number || data.updatedAt is int || (data.updatedAt is string && data.updatedAt.size() < 100)));
     }
 
     // ===============================================================
-    // Rules
+    // Collection Rules
     // ===============================================================
 
+    // Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
     match /users/{userId} {
-      allow read: if isOwner(userId) || isAdmin();
-      allow create: if isAuthenticated() && isOwner(userId) && isValidUser(request.resource.data);
-      allow update: if isAuthenticated() && isOwner(userId) && isValidUser(request.resource.data) && 
-                    request.resource.data.role == resource.data.role;
+      // Strict multi-tenant read: only self, superadmin, own admin or dependents of this agency
+      allow get: if isAuthenticated() && (
+                    isOwner(userId) || 
+                    isSuperAdmin() ||
+                    (isAdmin() && (resource.data.get('adminEmail', '') == request.auth.token.get('email', '') || resource.data.get('adminUid', '') == request.auth.uid)) ||
+                    (isDependentOf(resource.data.get('email', '')) && resource.data.get('email', '') == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('adminEmail', '')) ||
+                    (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('adminUid', '') == userId)
+                  );
+      
+      // Strict multi-tenant list: only superadmin or agency admin listing their own dependents
+      allow list: if isAuthenticated() && (
+                    isSuperAdmin() ||
+                    (isAdmin() && (resource.data.get('adminEmail', '') == request.auth.token.get('email', '') || resource.data.get('adminUid', '') == request.auth.uid))
+                  );
+      
+      allow create: if isAuthenticated() && isOwner(userId) && isValidUser(request.resource.data) &&
+                    (
+                      isSuperAdmin() ||
+                      // Standard users cannot self-assign premium status on creation
+                      request.resource.data.get('isPremium', false) == false
+                    );
+      
+      // Strict update protection: regular users CANNOT alter RBAC or licensing fields
+      allow update: if isAuthenticated() && isValidUser(request.resource.data) && 
+                    (
+                      isSuperAdmin() ||
+                      // Agency admin managing their dependent
+                      (
+                        isAdmin() && 
+                        (resource.data.get('adminEmail', '') == request.auth.token.get('email', '') || resource.data.get('adminUid', '') == request.auth.uid)
+                      ) ||
+                      // Regular user updating their own profile: RBAC fields MUST remain unchanged
+                      (
+                        isOwner(userId) &&
+                        request.resource.data.get('role', 'dependent') == resource.data.get('role', 'dependent') &&
+                        request.resource.data.get('isPremium', false) == resource.data.get('isPremium', false) &&
+                        request.resource.data.get('expirationDate', null) == resource.data.get('expirationDate', null) &&
+                        request.resource.data.get('licenseCode', null) == resource.data.get('licenseCode', null) &&
+                        request.resource.data.get('isActive', true) == resource.data.get('isActive', true) &&
+                        request.resource.data.get('isDeleted', false) == resource.data.get('isDeleted', false) &&
+                        request.resource.data.get('adminUid', null) == resource.data.get('adminUid', null) &&
+                        request.resource.data.get('adminEmail', null) == resource.data.get('adminEmail', null)
+                      )
+                    );
+
+      allow delete: if isAuthenticated() && 
+                    (
+                      isSuperAdmin() ||
+                      (
+                        isAdmin() && 
+                        (resource.data.get('adminEmail', '') == request.auth.token.get('email', '') ||
+                         resource.data.get('adminUid', '') == request.auth.uid)
+                      )
+                    );
+    }
+
+    match /licenses/{licenseId} {
+      allow get: if isAuthenticated() && (
+                    isSuperAdmin() || 
+                    resource.data.get('isUsed', false) == false || 
+                    resource.data.get('assignedTo', '') == request.auth.uid
+                  );
+      allow list: if isAuthenticated() && isSuperAdmin();
+      allow create, delete: if isAuthenticated() && isSuperAdmin() && isValidLicense(request.resource.data);
+      // Atomic activation: user can ONLY mark an unused license as used for themselves
+      allow update: if isAuthenticated() && (
+        isSuperAdmin() ||
+        (
+          resource.data.isUsed == false && 
+          request.resource.data.isUsed == true && 
+          request.resource.data.assignedTo == request.auth.uid &&
+          request.resource.data.code == resource.data.code &&
+          isValidLicense(request.resource.data)
+        )
+      );
     }
 
     match /inventories/{inventoryId} {
-      // Allow public GET for completed inventories (for PDF photo download)
-      allow get: if resource.data.status == 'completed';
-      
-      // Admins can read inventories where they are the adminEmail
-      // Dependents can read inventories they created
-      allow list: if isAuthenticated() && 
-                  (request.auth.uid == resource.data.createdBy || 
-                   getUserData().email == resource.data.adminEmail);
-      
-      // Authenticated get for non-completed or owned inventories
-      allow get: if isAuthenticated() && 
-                  (request.auth.uid == resource.data.createdBy || 
-                   getUserData().email == resource.data.adminEmail);
+      // Zero public read: must be authenticated and belong to the agency tenant
+      allow get: if isAuthenticated() && isUserActive() && (
+                    isSuperAdmin() ||
+                    isUserInSameAgency(resource.data.get('adminEmail', ''), resource.data.get('createdBy', ''))
+                  );
+
+      // Multi-tenant query enforcement
+      allow list: if isAuthenticated() && isUserActive() && (
+                    isSuperAdmin() ||
+                    isUserInSameAgency(resource.data.get('adminEmail', ''), resource.data.get('createdBy', ''))
+                  );
       
       allow create: if isAuthenticated() && 
+                    isUserActive() &&
                     isValidInventory(request.resource.data) &&
-                    request.resource.data.createdBy == request.auth.uid &&
-                    (getUserData().role == 'admin' ? 
-                      request.resource.data.adminEmail == getUserData().email : 
-                      request.resource.data.adminEmail == getUserData().adminEmail);
+                    (
+                      isSuperAdmin() ||
+                      request.resource.data.createdBy == request.auth.uid ||
+                      request.auth.token.get('email', '') == request.resource.data.adminEmail ||
+                      isDependentOf(request.resource.data.adminEmail)
+                    );
       
+      // Update rule with Completed Document Lock (ALTO-04) and Tenant Guard
       allow update: if isAuthenticated() && 
-                    isValidInventory(request.resource.data) &&
-                    (request.auth.uid == resource.data.createdBy || 
-                     getUserData().email == resource.data.adminEmail) &&
-                    request.resource.data.createdBy == resource.data.createdBy &&
-                    request.resource.data.adminEmail == resource.data.adminEmail &&
-                    (resource.data.status == 'draft' || 
-                     (resource.data.status == 'completed' && 
-                      request.resource.data.diff(resource.data).affectedKeys().hasOnly(['annexes'])));
+                    isUserActive() && 
+                    isValidInventory(request.resource.data) && 
+                    (
+                      isSuperAdmin() ||
+                      isUserInSameAgency(resource.data.get('adminEmail', ''), resource.data.get('createdBy', ''))
+                    ) &&
+                    (
+                      isSuperAdmin() ||
+                      // Draft inventories can be fully edited
+                      resource.data.get('status', 'draft') != 'completed' ||
+                      // Completed inventories have immutable spaces, photos and property data
+                      (
+                        request.resource.data.get('status', 'completed') == 'completed' &&
+                        request.resource.data.get('spaces', []) == resource.data.get('spaces', []) &&
+                        request.resource.data.get('address', '') == resource.data.get('address', '') &&
+                        request.resource.data.get('propertyName', '') == resource.data.get('propertyName', '') &&
+                        request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '') &&
+                        request.resource.data.get('adminEmail', '') == resource.data.get('adminEmail', '')
+                      )
+                    );
       
+      // Delete rule: completed inventories cannot be deleted by standard users
       allow delete: if isAuthenticated() && 
-                    (request.auth.uid == resource.data.createdBy || 
-                     getUserData().email == resource.data.adminEmail);
+                    isUserActive() &&
+                    (
+                      isSuperAdmin() ||
+                      (
+                        resource.data.get('status', 'draft') != 'completed' &&
+                        (
+                          resource.data.get('createdBy', '') == request.auth.uid || 
+                          (isAdmin() && resource.data.get('adminEmail', '') == request.auth.token.get('email', '')) ||
+                          request.auth.token.get('email', '') == resource.data.get('adminEmail', '')
+                        )
+                      )
+                    );
+    }
+
+    match /templates/{templateId} {
+      allow list: if isAuthenticated() && (
+                    isSuperAdmin() ||
+                    resource.data.createdBy == request.auth.uid || 
+                    (isAdmin() && resource.data.get('adminEmail', '') == request.auth.token.get('email', ''))
+                  );
+      allow get: if isAuthenticated() && (
+                    isSuperAdmin() ||
+                    resource.data.createdBy == request.auth.uid || 
+                    (isAdmin() && resource.data.get('adminEmail', '') == request.auth.token.get('email', ''))
+                  );
+      allow create: if isAuthenticated() && isUserActive() && isValidTemplate(request.resource.data) && request.resource.data.createdBy == request.auth.uid;
+      allow update: if isAuthenticated() && isUserActive() && (isSuperAdmin() || resource.data.createdBy == request.auth.uid) && isValidTemplate(request.resource.data);
+      allow delete: if isAuthenticated() && isUserActive() && (isSuperAdmin() || resource.data.createdBy == request.auth.uid);
     }
 
     // Fotos: un documento por foto (inventories/{id}/photos/{photoId})
@@ -158,7 +331,7 @@ service cloud.firestore {
     }
 
     match /test/connection {
-      allow read: if true;
+      allow read: if isAuthenticated();
     }
   }
 }

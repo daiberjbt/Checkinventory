@@ -1,15 +1,15 @@
 import React, { useState } from 'react';
 import { motion } from 'motion/react';
-import { Mail, Lock, Shield, Users, ArrowRight, User as UserIcon } from 'lucide-react';
+import { Mail, Lock, Shield, Users, ArrowRight, User as UserIcon, Key, Eye, EyeOff } from 'lucide-react';
 import { auth, db } from '../firebase';
-import { webOrigin } from '../native';
 import { 
   createUserWithEmailAndPassword, 
   signInWithEmailAndPassword,
   sendEmailVerification,
-  sendPasswordResetEmail
+  sendPasswordResetEmail,
+  signOut
 } from 'firebase/auth';
-import { doc, setDoc, getDoc, query, where, collection, getDocs } from 'firebase/firestore';
+import { doc, setDoc, getDoc, query, where, collection, getDocs, writeBatch, serverTimestamp } from 'firebase/firestore';
 import { UserRole } from '../types';
 
 export const Auth: React.FC = () => {
@@ -20,8 +20,11 @@ export const Auth: React.FC = () => {
   const [lastName, setLastName] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [role, setRole] = useState<UserRole>('admin');
   const [adminEmail, setAdminEmail] = useState('');
+  const [licenseCode, setLicenseCode] = useState('');
   const [error, setError] = useState('');
   const [successMessage, setSuccessMessage] = useState('');
   const [loading, setLoading] = useState(false);
@@ -34,7 +37,7 @@ export const Auth: React.FC = () => {
 
     try {
       await sendPasswordResetEmail(auth, email, {
-        url: webOrigin(),
+        url: window.location.origin,
       });
       setSuccessMessage('Se ha enviado un correo para restablecer tu contraseña. Por favor revisa tu bandeja de entrada.');
       setIsForgotPassword(false);
@@ -69,56 +72,168 @@ export const Auth: React.FC = () => {
           return;
         }
 
-        if (role === 'dependent' && !adminEmail) {
-          setError('El correo del administrador es requerido');
+        const isBootstrapAdmin = email.trim().toLowerCase() === 'djbtorreglosa@gmail.com';
+        const cleanedLicenseCode = licenseCode.trim().toUpperCase();
+
+        if (role === 'admin' && !isBootstrapAdmin && !cleanedLicenseCode) {
+          setError('Por favor ingresa un código de activación de licencia de 6 meses para registrarte como Administrador.');
           setLoading(false);
           return;
         }
 
+        let user;
+        let isExistingAuthAccount = false;
+
+        try {
+          const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+          user = userCredential.user;
+        } catch (authCreateErr: any) {
+          if (authCreateErr.code === 'auth/email-already-in-use') {
+            // Check if we can sign in with the provided password to reconcile the account
+            try {
+              const signCred = await signInWithEmailAndPassword(auth, email, password);
+              user = signCred.user;
+              isExistingAuthAccount = true;
+            } catch (signInErr: any) {
+              if (signInErr.code === 'auth/wrong-password' || signInErr.code === 'auth/invalid-credential') {
+                setError('Este correo electrónico ya está registrado en el sistema de autenticación. Por favor inicia sesión con tu contraseña o usa "¿Olvidaste tu contraseña?" para restablecerla.');
+                setIsLogin(true);
+                setLoading(false);
+                return;
+              }
+              throw authCreateErr;
+            }
+          } else {
+            throw authCreateErr;
+          }
+        }
+
+        let adminUid = null;
+        let adminName = null;
         if (role === 'dependent') {
           // Check if adminEmail exists and is an admin
-          const q = query(collection(db, 'users'), where('email', '==', adminEmail), where('role', '==', 'admin'));
+          const q = query(collection(db, 'users'), where('email', '==', adminEmail.trim().toLowerCase()), where('role', '==', 'admin'));
           const querySnapshot = await getDocs(q);
           
           if (querySnapshot.empty) {
+            if (!isExistingAuthAccount && user) {
+              try { await user.delete(); } catch (e) { /* ignore */ }
+            }
             setError('El correo proporcionado no corresponde a un administrador registrado.');
             setLoading(false);
             return;
           }
+          const adminDoc = querySnapshot.docs[0];
+          adminUid = adminDoc.id;
+          const adminData = adminDoc.data();
+          adminName = `${adminData.firstName || ''} ${adminData.lastName || ''}`.trim() || adminData.email;
         }
 
-        const userCredential = await createUserWithEmailAndPassword(auth, email, password);
-        const user = userCredential.user;
+        let licenseDocRef = null;
+        let expirationDateIso = null;
 
-        // Send verification email
-        await sendEmailVerification(user, {
-          url: webOrigin(),
-          handleCodeInApp: false,
-        });
+        if (role === 'admin') {
+          if (!isBootstrapAdmin && cleanedLicenseCode) {
+            licenseDocRef = doc(db, 'licenses', cleanedLicenseCode);
+            try {
+              const licenseSnap = await getDoc(licenseDocRef);
+
+              if (licenseSnap.exists()) {
+                const licenseData = licenseSnap.data() as any;
+                if (licenseData?.isUsed && licenseData?.assignedTo !== user.uid) {
+                  if (!isExistingAuthAccount && user) {
+                    try { await user.delete(); } catch (e) { /* ignore */ }
+                  }
+                  setError('Este código de activación ya ha sido utilizado.');
+                  setLoading(false);
+                  return;
+                }
+              }
+            } catch (licErr) {
+              console.warn('Licence check warning:', licErr);
+            }
+
+            const expiration = new Date();
+            expiration.setDate(expiration.getDate() + 180); // 6 months (180 days)
+            expirationDateIso = expiration.toISOString();
+          } else {
+            const expiration = new Date();
+            expiration.setFullYear(expiration.getFullYear() + 10);
+            expirationDateIso = expiration.toISOString();
+          }
+        }
+
+        // Try to send verification email (non-blocking if service is disabled in dev)
+        try {
+          await sendEmailVerification(user, {
+            url: window.location.origin,
+            handleCodeInApp: false,
+          });
+        } catch (emailErr) {
+          console.warn('Verification email notice (handled):', emailErr);
+        }
 
         // Store role in Firestore
-        await setDoc(doc(db, 'users', user.uid), {
-          email,
-          firstName,
-          lastName,
+        const userRef = doc(db, 'users', user.uid);
+        const userData: any = {
+          email: email.trim().toLowerCase(),
+          firstName: firstName.trim() || 'Usuario',
+          lastName: lastName.trim() || '',
           role,
-          adminEmail: role === 'dependent' ? adminEmail : null,
-          createdAt: new Date().toISOString()
-        });
+          adminEmail: role === 'dependent' ? adminEmail.trim().toLowerCase() : null,
+          adminUid: role === 'dependent' ? adminUid : null,
+          adminName: role === 'dependent' ? adminName : null,
+          hasSeenOnboarding: false,
+          createdAt: new Date().toISOString(),
+          isPremium: role === 'admin',
+          plan: role === 'admin' ? 'license' : null,
+          expirationDate: expirationDateIso,
+          licenseCode: role === 'admin' && !isBootstrapAdmin ? cleanedLicenseCode : null,
+          isActive: true,
+          isDeleted: false,
+        };
 
-        setSuccessMessage('¡Cuenta creada! Por favor verifica tu correo electrónico para continuar. Hemos enviado un enlace de confirmación.');
-        setIsLogin(true);
+        // Use a batch to ensure atomicity
+        const batch = writeBatch(db);
+        batch.set(userRef, userData, { merge: true });
+
+        if (licenseDocRef && role === 'admin' && !isBootstrapAdmin) {
+          try {
+            batch.update(licenseDocRef, {
+              isUsed: true,
+              assignedTo: user.uid,
+              assignedEmail: email,
+              activatedAt: new Date().toISOString(),
+              expiresAt: expirationDateIso,
+            });
+          } catch (licBatchErr) {
+            console.warn('License batch update notice:', licBatchErr);
+          }
+        }
+
+        await batch.commit();
+
+        if (isExistingAuthAccount) {
+          setSuccessMessage('¡Cuenta sincronizada y activada con éxito en la base de datos!');
+        } else {
+          setSuccessMessage('¡Cuenta creada con éxito! Por favor verifica tu correo electrónico para continuar. Hemos enviado un enlace de confirmación.');
+          setIsLogin(true);
+        }
       }
     } catch (err: any) {
       console.error(err);
+      if (auth.currentUser) {
+        await signOut(auth);
+      }
       if (err.code === 'auth/user-not-found') {
         setError('Este correo no está registrado. ¿Deseas crear una cuenta?');
       } else if (err.code === 'auth/wrong-password' || err.code === 'auth/invalid-credential') {
-        setError('Credenciales incorrectas');
+        setError('Credenciales incorrectas. Verifica tu correo y contraseña.');
       } else if (err.code === 'auth/email-already-in-use') {
-        setError('El correo ya está registrado');
+        setError('Este correo electrónico ya está registrado. Hemos cambiado a la pestaña de Iniciar Sesión para que puedas ingresar con tu contraseña.');
+        setIsLogin(true);
       } else {
-        setError('Ocurrió un error. Inténtalo de nuevo.');
+        setError('Ocurrió un error: ' + (err.message || 'Inténtalo de nuevo.'));
       }
     } finally {
       setLoading(false);
@@ -197,13 +312,23 @@ export const Auth: React.FC = () => {
                 <div className="relative">
                   <Lock className="absolute left-4 top-1/2 -translate-y-1/2 text-muted opacity-40" size={18} />
                   <input 
-                    type="password"
+                    type={showPassword ? "text" : "password"}
                     required
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
-                    className="w-full bg-[#f8f9fa] border border-black/5 rounded-2xl pl-12 pr-4 py-4 focus:ring-2 focus:ring-black outline-none transition-all"
+                    className="w-full bg-[#f8f9fa] border border-black/5 rounded-2xl pl-12 pr-12 py-4 focus:ring-2 focus:ring-black outline-none transition-all"
                     placeholder="••••••••"
                   />
+                  <button
+                    type="button"
+                    id="toggle-auth-password-visibility-btn"
+                    onClick={() => setShowPassword(prev => !prev)}
+                    className="absolute right-4 top-1/2 -translate-y-1/2 text-muted hover:text-black transition-colors p-1"
+                    title={showPassword ? "Ocultar contraseña" : "Ver contraseña"}
+                    aria-label={showPassword ? "Ocultar contraseña" : "Ver contraseña"}
+                  >
+                    {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+                  </button>
                 </div>
                 {isLogin && (
                   <button 
@@ -232,13 +357,23 @@ export const Auth: React.FC = () => {
                   <div className="relative">
                     <Lock className="absolute left-4 top-1/2 -translate-y-1/2 text-muted opacity-40" size={18} />
                     <input 
-                      type="password"
+                      type={showConfirmPassword ? "text" : "password"}
                       required
                       value={confirmPassword}
                       onChange={(e) => setConfirmPassword(e.target.value)}
-                      className="w-full bg-[#f8f9fa] border border-black/5 rounded-2xl pl-12 pr-4 py-4 focus:ring-2 focus:ring-black outline-none transition-all"
+                      className="w-full bg-[#f8f9fa] border border-black/5 rounded-2xl pl-12 pr-12 py-4 focus:ring-2 focus:ring-black outline-none transition-all"
                       placeholder="••••••••"
                     />
+                    <button
+                      type="button"
+                      id="toggle-auth-confirm-password-visibility-btn"
+                      onClick={() => setShowConfirmPassword(prev => !prev)}
+                      className="absolute right-4 top-1/2 -translate-y-1/2 text-muted hover:text-black transition-colors p-1"
+                      title={showConfirmPassword ? "Ocultar contraseña" : "Ver contraseña"}
+                      aria-label={showConfirmPassword ? "Ocultar contraseña" : "Ver contraseña"}
+                    >
+                      {showConfirmPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+                    </button>
                   </div>
                 </div>
 
@@ -294,6 +429,47 @@ export const Auth: React.FC = () => {
                     </button>
                   </div>
                 </div>
+
+                {role === 'admin' && (
+                  <motion.div 
+                    initial={{ opacity: 0, y: -10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="space-y-4"
+                  >
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-bold uppercase tracking-widest text-muted ml-1 flex items-center justify-between">
+                        <span>Código de Activación (Licencia 6 Meses)</span>
+                        {email.trim().toLowerCase() === 'djbtorreglosa@gmail.com' && (
+                          <span className="text-[10px] text-emerald-600 font-bold">Admin Principal (Exento)</span>
+                        )}
+                      </label>
+                      <div className="relative">
+                        <Key className="absolute left-4 top-1/2 -translate-y-1/2 text-muted opacity-40" size={18} />
+                        <input 
+                          type="text"
+                          required={email.trim().toLowerCase() !== 'djbtorreglosa@gmail.com'}
+                          value={licenseCode}
+                          onChange={(e) => setLicenseCode(e.target.value.toUpperCase())}
+                          className="w-full bg-[#f8f9fa] border border-black/5 rounded-2xl pl-12 pr-4 py-4 focus:ring-2 focus:ring-black outline-none transition-all font-mono uppercase placeholder:normal-case"
+                          placeholder="CHK-6M-XXXX-XXXX"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="bg-black/5 p-4 rounded-2xl border border-black/5 text-center">
+                      <p className="text-xs font-bold text-black">Licencia Temporal de 6 Meses</p>
+                      <p className="text-[11px] text-muted mt-1">El acceso a la app se activa mediante un código de licencia válido por 180 días.</p>
+                      <a 
+                        href="https://wa.me/573000000000?text=Hola,%20deseo%20comprar%20el%20código%20de%20activación%20de%20la%20licencia%20temporal%20de%206%20meses%20para%20CheckInventory" 
+                        target="_blank" 
+                        rel="noopener noreferrer"
+                        className="mt-3 inline-flex items-center justify-center gap-2 text-xs font-bold text-black underline hover:text-black/70 transition-colors"
+                      >
+                        ¿No tienes un código? Adquirir licencia aquí
+                      </a>
+                    </div>
+                  </motion.div>
+                )}
 
                 {role === 'dependent' && (
                   <motion.div 

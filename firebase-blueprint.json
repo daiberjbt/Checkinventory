@@ -5,91 +5,105 @@
       "description": "User profile and role information",
       "type": "object",
       "properties": {
-        "email": {
-          "type": "string",
-          "format": "email"
-        },
-        "role": {
-          "type": "string",
-          "enum": [
-            "admin",
-            "dependent"
-          ]
-        },
-        "adminEmail": {
-          "type": "string",
-          "format": "email",
-          "description": "Email of the admin if role is dependent"
-        }
+        "email": { "type": "string", "format": "email" },
+        "role": { "type": "string", "enum": ["admin", "dependent"] },
+        "adminEmail": { "type": "string", "format": "email", "description": "Email of the admin if role is dependent" },
+        "adminUid": { "type": "string", "description": "UID of the admin for dependents" },
+        "adminName": { "type": "string", "description": "Name of the admin for dependents" },
+        "firstName": { "type": "string" },
+        "lastName": { "type": "string" },
+        "agencyName": { "type": "string", "description": "Name or brand of the agency" },
+        "agencyLogo": { "type": "string", "description": "Agency logo dataUrl or storage URL" },
+        "themePreference": { "type": "string", "enum": ["light", "dark", "system"] },
+        "isDarkMode": { "type": "boolean", "description": "Dark mode preference" },
+        "hasSeenOnboarding": { "type": "boolean", "description": "Whether the user has seen the onboarding tour" },
+        "isPremium": { "type": "boolean", "description": "Whether the user has an active subscription" },
+        "plan": { "type": "string", "enum": ["monthly", "yearly", "license"], "description": "Type of active plan" },
+        "expirationDate": { "type": "string", "description": "When the premium status expires" },
+        "licenseCode": { "type": "string", "description": "The license code used to activate admin status" },
+        "isActive": { "type": "boolean", "description": "Whether the user account is active" },
+        "isDeleted": { "type": "boolean", "description": "Whether the user account is soft-deleted" },
+        "ownerTemplate": { "type": "string" },
+        "tenantTemplate": { "type": "string" },
+        "id": { "type": "string" },
+        "updatedAt": { "type": "number" },
+        "createdAt": { "type": "string" }
       },
-      "required": [
-        "email",
-        "role"
-      ]
+      "required": ["email", "role"]
+    },
+    "License": {
+      "title": "License",
+      "description": "License codes for admin access",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "code": { "type": "string" },
+        "isUsed": { "type": "boolean" },
+        "expiresAt": { "type": "string", "format": "date-time" },
+        "assignedTo": { "type": "string", "description": "UID of the user assigned to this license" },
+        "assignedEmail": { "type": "string", "format": "email" },
+        "activatedAt": { "type": "string" },
+        "durationMonths": { "type": "number" },
+        "createdAt": { "type": "string" },
+        "createdBy": { "type": "string" }
+      },
+      "required": ["code", "isUsed"]
     },
     "Inventory": {
       "title": "Inventory",
       "description": "Property inventory record",
       "type": "object",
       "properties": {
-        "propertyName": {
-          "type": "string"
-        },
-        "address": {
-          "type": "string"
-        },
-        "date": {
-          "type": "string"
-        },
-        "status": {
-          "type": "string",
-          "enum": [
-            "draft",
-            "completed"
-          ]
-        },
-        "createdBy": {
-          "type": "string",
-          "description": "UID of the user who created it"
-        },
-        "adminEmail": {
-          "type": "string",
-          "description": "Email of the admin responsible for this inventory"
-        },
-        "annexes": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "properties": {
-              "id": {
-                "type": "string"
-              },
-              "text": {
-                "type": "string"
-              },
-              "photos": {
-                "type": "array"
-              },
-              "createdAt": {
-                "type": "number"
-              },
-              "createdBy": {
-                "type": "string"
-              },
-              "creatorName": {
-                "type": "string"
-              }
-            }
-          }
-        }
+        "id": { "type": "string" },
+        "propertyName": { "type": "string" },
+        "propertyType": { "type": "string", "enum": ["Apartamento", "Oficina", "Local", "Bodega", "Casa", "Otro"] },
+        "customPropertyType": { "type": "string" },
+        "address": { "type": "string" },
+        "neighborhood": { "type": "string" },
+        "rentValue": { "type": "string" },
+        "internalCode": { "type": "string" },
+        "ownerName": { "type": "string" },
+        "ownerEmail": { "type": "string", "format": "email" },
+        "tenantName": { "type": "string" },
+        "tenantEmail": { "type": "string", "format": "email" },
+        "date": { "type": "string" },
+        "spaces": { "type": "array" },
+        "annexes": { "type": "array" },
+        "createdAt": { "type": "number" },
+        "updatedAt": { "type": "number" },
+        "status": { "type": "string", "enum": ["draft", "completed", "archived"] },
+        "ownerSignature": { "type": "string" },
+        "tenantSignature": { "type": "string" },
+        "tenantReceiveDate": { "type": "string" },
+        "tenantReceiveText": { "type": "string" },
+        "tenantReceiveSignature": { "type": "string" },
+        "ownerDeliveryDate": { "type": "string" },
+        "ownerDeliveryText": { "type": "string" },
+        "ownerDeliverySignature": { "type": "string" },
+        "remoteSigningTokens": { "type": "object" },
+        "ownerRemoteSigned": { "type": "boolean" },
+        "tenantRemoteSigned": { "type": "boolean" },
+        "ownerSignedActSent": { "type": "boolean" },
+        "tenantSignedActSent": { "type": "boolean" },
+        "createdBy": { "type": "string", "description": "UID of the user who created it" },
+        "creatorName": { "type": "string" },
+        "adminEmail": { "type": "string", "description": "Email of the admin responsible for this inventory" }
       },
-      "required": [
-        "propertyName",
-        "address",
-        "date",
-        "status",
-        "createdBy"
-      ]
+      "required": ["propertyName", "address", "date", "status", "createdBy", "adminEmail", "createdAt", "spaces"]
+    },
+    "Template": {
+      "title": "InventoryTemplate",
+      "description": "Custom space template",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "templateName": { "type": "string" },
+        "propertyType": { "type": "string" },
+        "createdBy": { "type": "string" },
+        "createdAt": { "type": "number" },
+        "structure": { "type": "array" }
+      },
+      "required": ["templateName", "propertyType", "createdBy", "createdAt", "structure"]
     }
   },
   "firestore": {
@@ -101,8 +115,13 @@
       "schema": "Inventory",
       "description": "Inventory records"
     },
-    "inventories/{inventoryId}/photos/{photoId}": {
-      "description": "Una foto por documento (dataUrl JPEG comprimido, timestamp, spaceId o annexId, createdBy)"
+    "licenses/{licenseId}": {
+      "schema": "License",
+      "description": "License codes for admin access"
+    },
+    "templates/{templateId}": {
+      "schema": "Template",
+      "description": "Inventory space templates"
     }
   }
 }

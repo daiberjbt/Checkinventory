@@ -1,1 +1,512 @@
 @import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Android & Mobile Touch Optimizations */
+html, body {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior-y: contain;
+}
+
+html.dark, body.dark {
+  background-color: #000000;
+  color: #f4f4f5;
+  color-scheme: dark;
+}
+
+/* Hide scrollbar while preserving scroll functionality */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* Safe area padding utilities for notches and navigation bars */
+.pb-safe {
+  padding-bottom: max(1rem, env(safe-area-inset-bottom, 1rem));
+}
+
+.pt-safe {
+  padding-top: max(1rem, env(safe-area-inset-top, 1rem));
+}
+
+/* Custom scrollbars in Dark Mode */
+.dark ::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.dark ::-webkit-scrollbar-track {
+  background: #09090b;
+}
+.dark ::-webkit-scrollbar-thumb {
+  background: #27272a;
+  border-radius: 9999px;
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: #3f3f46;
+}
+
+/* Centralized Dark Mode Styling - True Black & Neutral Palette */
+.dark {
+  color-scheme: dark;
+}
+
+.dark .min-h-screen {
+  background-color: #000000 !important;
+}
+
+.dark .bg-white {
+  background-color: #121214 !important;
+  color: #f4f4f5;
+}
+
+/* Translucent floating bars & glassmorphism in Dark Mode */
+.dark .bg-white\/95,
+.dark .bg-white\/90,
+.dark .bg-white\/80,
+.dark .bg-white\/70,
+.dark .bg-white\/60 {
+  background-color: rgba(18, 18, 20, 0.92) !important;
+  color: #f4f4f5;
+}
+
+.dark .bg-white\/50,
+.dark .bg-white\/40,
+.dark .bg-white\/30,
+.dark .bg-white\/20,
+.dark .bg-white\/10,
+.dark .bg-white\/5 {
+  background-color: rgba(255, 255, 255, 0.06) !important;
+  color: #f4f4f5;
+}
+
+/* Neutral deep card & section backgrounds in Dark Mode (No blue tint) */
+.dark .bg-\[\#fcfcfc\],
+.dark .bg-\[\#fafafa\],
+.dark .bg-\[\#f9fafb\],
+.dark .bg-\[\#f8f9fa\],
+.dark .bg-\[\#f3f4f6\],
+.dark .bg-\[\#f1f5f9\],
+.dark .bg-neutral-50,
+.dark .bg-neutral-100,
+.dark .bg-gray-50,
+.dark .bg-gray-100,
+.dark .bg-slate-50,
+.dark .bg-slate-100,
+.dark .bg-zinc-50,
+.dark .bg-zinc-100,
+.dark .bg-stone-50,
+.dark .bg-stone-100 {
+  background-color: #18181b !important;
+}
+
+.dark .bg-neutral-200,
+.dark .bg-gray-200,
+.dark .bg-slate-200,
+.dark .bg-zinc-200,
+.dark .bg-stone-200 {
+  background-color: #27272a !important;
+}
+
+/* Borders & Dividers in Dark Mode */
+.dark .border-black\/5,
+.dark .border-black\/10,
+.dark .border-black\/20,
+.dark .border-black\/30,
+.dark .border-neutral-200,
+.dark .border-neutral-300,
+.dark .border-gray-100,
+.dark .border-gray-200,
+.dark .border-slate-100,
+.dark .border-slate-200,
+.dark .border-zinc-100,
+.dark .border-zinc-200 {
+  border-color: rgba(255, 255, 255, 0.08) !important;
+}
+
+.dark .border-dashed {
+  border-color: rgba(255, 255, 255, 0.15) !important;
+}
+
+.dark hr,
+.dark .divide-black\/5 > :not([hidden]) ~ :not([hidden]),
+.dark .divide-black\/10 > :not([hidden]) ~ :not([hidden]) {
+  border-color: rgba(255, 255, 255, 0.08) !important;
+}
+
+/* High contrast primary buttons in Dark Mode */
+.dark .bg-black.text-white,
+.dark button.bg-black:not(.text-black),
+.dark a.bg-black:not(.text-black) {
+  background-color: #ffffff !important;
+  color: #000000 !important;
+}
+
+.dark .bg-black.text-white *,
+.dark button.bg-black:not(.text-black) *,
+.dark a.bg-black:not(.text-black) * {
+  color: #000000 !important;
+}
+
+.dark .bg-black.text-white .bg-white\/20,
+.dark button.bg-black:not(.text-black) .bg-white\/20,
+.dark a.bg-black:not(.text-black) .bg-white\/20 {
+  background-color: rgba(0, 0, 0, 0.12) !important;
+  color: #000000 !important;
+}
+
+.dark .bg-black.text-white:hover,
+.dark button.bg-black:not(.text-black):hover,
+.dark a.bg-black:not(.text-black):hover {
+  background-color: #e4e4e7 !important;
+}
+
+/* Secondary chips and buttons with bg-black/5 or bg-black/10 */
+.dark .bg-black\/5,
+.dark .bg-black\/10 {
+  background-color: rgba(255, 255, 255, 0.07) !important;
+  color: #f4f4f5;
+}
+
+.dark .bg-black\/5:hover,
+.dark .bg-black\/10:hover,
+.dark .hover\:bg-black\/10:hover,
+.dark .hover\:bg-black\/5:hover {
+  background-color: rgba(255, 255, 255, 0.13) !important;
+}
+
+/* Protect colorful action buttons from text inversions */
+.dark .bg-emerald-600,
+.dark .bg-emerald-700,
+.dark .bg-green-600,
+.dark .bg-green-700,
+.dark .bg-red-600,
+.dark .bg-red-700,
+.dark .bg-blue-600,
+.dark .bg-blue-700,
+.dark .bg-indigo-600,
+.dark .bg-indigo-700,
+.dark .bg-purple-600,
+.dark .bg-purple-700,
+.dark .bg-rose-600,
+.dark .bg-rose-700 {
+  color: #ffffff !important;
+}
+
+.dark .bg-emerald-600 *,
+.dark .bg-emerald-700 *,
+.dark .bg-green-600 *,
+.dark .bg-green-700 *,
+.dark .bg-red-600 *,
+.dark .bg-red-700 *,
+.dark .bg-blue-600 *,
+.dark .bg-blue-700 *,
+.dark .bg-indigo-600 *,
+.dark .bg-indigo-700 *,
+.dark .bg-purple-600 *,
+.dark .bg-purple-700 *,
+.dark .bg-rose-600 *,
+.dark .bg-rose-700 * {
+  color: #ffffff !important;
+}
+
+/* Typography & Headings in Dark Mode */
+.dark h1,
+.dark h2,
+.dark h3,
+.dark h4,
+.dark h5,
+.dark h6 {
+  color: #fafafa !important;
+}
+
+.dark .text-black,
+.dark .text-neutral-900,
+.dark .text-neutral-800,
+.dark .text-gray-900,
+.dark .text-gray-800,
+.dark .text-slate-900,
+.dark .text-slate-800,
+.dark .text-zinc-900,
+.dark .text-zinc-800,
+.dark .text-stone-900,
+.dark .text-stone-800 {
+  color: #fafafa !important;
+}
+
+.dark .text-neutral-700,
+.dark .text-neutral-600,
+.dark .text-gray-700,
+.dark .text-gray-600,
+.dark .text-slate-700,
+.dark .text-slate-600,
+.dark .text-zinc-700,
+.dark .text-zinc-600,
+.dark .text-stone-700,
+.dark .text-stone-600 {
+  color: #d4d4d8 !important;
+}
+
+.dark .text-muted,
+.dark .text-neutral-500,
+.dark .text-gray-500,
+.dark .text-slate-500,
+.dark .text-zinc-500,
+.dark .text-stone-500,
+.dark .text-neutral-400,
+.dark .text-gray-400,
+.dark .text-slate-400,
+.dark .text-zinc-400,
+.dark .text-stone-400 {
+  color: #a1a1aa !important;
+}
+
+/* CRITICAL: Convert black opacity text to light readable opacity in Dark Mode */
+.dark .text-black\/90,
+.dark .text-black\/80 {
+  color: rgba(250, 250, 250, 0.95) !important;
+}
+
+.dark .text-black\/70,
+.dark .text-black\/60 {
+  color: rgba(228, 228, 231, 0.85) !important;
+}
+
+.dark .text-black\/50,
+.dark .text-black\/40 {
+  color: rgba(161, 161, 170, 0.75) !important;
+}
+
+.dark .text-black\/30,
+.dark .text-black\/20 {
+  color: rgba(161, 161, 170, 0.50) !important;
+}
+
+.dark .text-black\/10 {
+  color: rgba(161, 161, 170, 0.30) !important;
+}
+
+/* Status text colors - brighten for high contrast dark readability */
+.dark .text-emerald-700,
+.dark .text-emerald-800,
+.dark .text-emerald-900,
+.dark .text-green-700,
+.dark .text-green-800,
+.dark .text-green-900 {
+  color: #6ee7b7 !important;
+}
+
+.dark .text-emerald-600,
+.dark .text-green-600 {
+  color: #34d399 !important;
+}
+
+.dark .text-amber-700,
+.dark .text-amber-800,
+.dark .text-amber-900,
+.dark .text-yellow-700,
+.dark .text-yellow-800,
+.dark .text-yellow-900 {
+  color: #fde047 !important;
+}
+
+.dark .text-amber-600,
+.dark .text-yellow-600 {
+  color: #fbbf24 !important;
+}
+
+.dark .text-red-700,
+.dark .text-red-800,
+.dark .text-red-900,
+.dark .text-rose-700,
+.dark .text-rose-800,
+.dark .text-rose-900 {
+  color: #fca5a5 !important;
+}
+
+.dark .text-red-600,
+.dark .text-rose-600 {
+  color: #f87171 !important;
+}
+
+.dark .text-blue-700,
+.dark .text-blue-800,
+.dark .text-blue-900,
+.dark .text-indigo-700,
+.dark .text-indigo-800,
+.dark .text-indigo-900 {
+  color: #93c5fd !important;
+}
+
+.dark .text-blue-600,
+.dark .text-indigo-600 {
+  color: #60a5fa !important;
+}
+
+.dark .text-purple-700,
+.dark .text-purple-800,
+.dark .text-purple-900 {
+  color: #d8b4fe !important;
+}
+
+.dark .text-purple-600 {
+  color: #c084fc !important;
+}
+
+.dark .text-orange-700,
+.dark .text-orange-800 {
+  color: #fdba74 !important;
+}
+
+.dark .text-orange-600 {
+  color: #fb923c !important;
+}
+
+/* Status & Notification Pills in Dark Mode */
+.dark .bg-emerald-50,
+.dark .bg-green-50,
+.dark .bg-emerald-100,
+.dark .bg-green-100 {
+  background-color: rgba(16, 185, 129, 0.16) !important;
+  color: #6ee7b7 !important;
+  border-color: rgba(16, 185, 129, 0.28) !important;
+}
+
+.dark .bg-red-50,
+.dark .bg-rose-50,
+.dark .bg-red-100,
+.dark .bg-rose-100 {
+  background-color: rgba(239, 68, 68, 0.16) !important;
+  color: #fca5a5 !important;
+  border-color: rgba(239, 68, 68, 0.28) !important;
+}
+
+.dark .bg-amber-50,
+.dark .bg-yellow-50,
+.dark .bg-amber-100,
+.dark .bg-yellow-100 {
+  background-color: rgba(245, 158, 11, 0.16) !important;
+  color: #fde047 !important;
+  border-color: rgba(245, 158, 11, 0.28) !important;
+}
+
+.dark .bg-blue-50,
+.dark .bg-indigo-50,
+.dark .bg-blue-100,
+.dark .bg-indigo-100 {
+  background-color: rgba(99, 102, 241, 0.16) !important;
+  color: #a5b4fc !important;
+  border-color: rgba(99, 102, 241, 0.28) !important;
+}
+
+.dark .bg-purple-50,
+.dark .bg-purple-100 {
+  background-color: rgba(168, 85, 247, 0.16) !important;
+  color: #d8b4fe !important;
+  border-color: rgba(168, 85, 247, 0.28) !important;
+}
+
+.dark .bg-orange-50,
+.dark .bg-orange-100 {
+  background-color: rgba(249, 115, 22, 0.16) !important;
+  color: #fdba74 !important;
+  border-color: rgba(249, 115, 22, 0.28) !important;
+}
+
+/* Form Inputs, Textareas, Selects in Dark Mode */
+.dark input:not([type="checkbox"]):not([type="radio"]):not([type="color"]),
+.dark textarea,
+.dark select {
+  background-color: #18181b !important;
+  color: #fafafa !important;
+  border-color: rgba(255, 255, 255, 0.12) !important;
+}
+
+.dark select option {
+  background-color: #18181b !important;
+  color: #fafafa !important;
+}
+
+.dark input::placeholder,
+.dark textarea::placeholder {
+  color: #71717a !important;
+}
+
+.dark input:focus,
+.dark textarea:focus,
+.dark select:focus {
+  border-color: rgba(255, 255, 255, 0.35) !important;
+  outline: none;
+}
+
+/* Signature Canvas & Signature Image Containers - Maintain White Background for Black Digital Ink */
+.signature-canvas-box,
+.dark .signature-canvas-box,
+.dark .signature-box,
+.dark div:has(> img[alt*="Firma"]),
+.dark div:has(> img[alt*="firma"]),
+.dark div:has(> img[alt*="Signature"]),
+.dark div:has(> img[alt*="signature"]) {
+  background-color: #ffffff !important;
+}
+
+/* Preserve Inventory Photos in Dark Mode */
+.dark img {
+  filter: none !important;
+}
+
+/* Quill Fonts */
+.ql-font-serif {
+  font-family: Georgia, 'Times New Roman', serif;
+}
+
+.ql-font-monospace {
+  font-family: 'JetBrains Mono', 'Courier New', Courier, monospace;
+}
+
+.ql-font-inter {
+  font-family: 'Inter', sans-serif;
+}
+
+.ql-font-arial {
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+.ql-editor {
+  min-height: 150px;
+  font-size: 14px;
+}
+
+/* Quill Editor in Dark Mode */
+.dark .ql-toolbar.ql-snow {
+  background-color: #18181b;
+  border-color: rgba(255, 255, 255, 0.1) !important;
+}
+
+.dark .ql-toolbar.ql-snow .ql-stroke {
+  stroke: #d4d4d8;
+}
+
+.dark .ql-toolbar.ql-snow .ql-fill {
+  fill: #d4d4d8;
+}
+
+.dark .ql-toolbar.ql-snow .ql-picker {
+  color: #d4d4d8;
+}
+
+.dark .ql-container.ql-snow {
+  background-color: #121214;
+  border-color: rgba(255, 255, 255, 0.1) !important;
+  color: #fafafa;
+}
+
+.dark .ql-snow .ql-picker-options {
+  background-color: #18181b;
+  border-color: rgba(255, 255, 255, 0.1);
+  color: #fafafa;
+}
+

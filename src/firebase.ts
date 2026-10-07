@@ -1,20 +1,30 @@
 import { initializeApp } from 'firebase/app';
 import { getAuth } from 'firebase/auth';
-import { initializeFirestore, persistentLocalCache, persistentSingleTabManager, CACHE_SIZE_UNLIMITED } from 'firebase/firestore';
+import { initializeFirestore, enableIndexedDbPersistence } from 'firebase/firestore';
+import { getStorage } from 'firebase/storage';
 import firebaseConfig from '../firebase-applet-config.json';
 
 const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
+export const db = initializeFirestore(app, {
+  experimentalForceLongPolling: true,
+  host: "firestore.googleapis.com",
+}, firebaseConfig.firestoreDatabaseId);
 
-// Caché persistente en el dispositivo: la app lee y escribe sin internet
-// y Firestore sincroniza solo cuando vuelve la conexión.
-export const db = initializeFirestore(
-  app,
-  {
-    localCache: persistentLocalCache({
-      tabManager: persistentSingleTabManager(undefined),
-      cacheSizeBytes: CACHE_SIZE_UNLIMITED, // con cientos de fotos por inventario no se debe purgar la caché
-    }),
-  },
-  firebaseConfig.firestoreDatabaseId
-);
+// Enable offline persistence to reduce read quota usage
+enableIndexedDbPersistence(db).catch((err) => {
+  if (err.code === 'failed-precondition') {
+    // Multiple tabs open, persistence can only be enabled in one tab at a time.
+    console.warn('Firestore persistence failed: multiple tabs open');
+  } else if (err.code === 'unimplemented') {
+    // The current browser does not support all of the features required to enable persistence
+    console.warn('Firestore persistence failed: browser not supported');
+  }
+});
+
+// Use default storage initialization from app config
+export const storage = getStorage(app);
+storage.maxUploadRetryTime = 8000; // 8 seconds
+storage.maxOperationRetryTime = 8000; // 8 seconds
+
+console.log('Firebase Storage initialized');

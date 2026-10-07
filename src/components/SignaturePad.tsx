@@ -10,7 +10,13 @@ interface SignaturePadProps {
 export const SignaturePad: React.FC<SignaturePadProps> = ({ onSave, label, initialValue }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [isDrawing, setIsDrawing] = useState(false);
+  const isEmptyRef = useRef(!initialValue);
   const [isEmpty, setIsEmpty] = useState(!initialValue);
+
+  // Sync state with ref
+  useEffect(() => {
+    isEmptyRef.current = isEmpty;
+  }, [isEmpty]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -19,36 +25,69 @@ export const SignaturePad: React.FC<SignaturePadProps> = ({ onSave, label, initi
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    ctx.strokeStyle = '#000';
-    ctx.lineWidth = 2;
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
+    const loadInitialValue = () => {
+      if (initialValue) {
+        const img = new Image();
+        img.onload = () => {
+          const rect = canvas.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) {
+            canvas.width = rect.width;
+            canvas.height = rect.height;
+            ctx.strokeStyle = '#000';
+            ctx.lineWidth = 2;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            setIsEmpty(false);
+          }
+        };
+        img.src = initialValue;
+      } else {
+        const rect = canvas.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) {
+          canvas.width = rect.width;
+          canvas.height = rect.height;
+          ctx.strokeStyle = '#000';
+          ctx.lineWidth = 2;
+          ctx.lineCap = 'round';
+          ctx.lineJoin = 'round';
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          setIsEmpty(true);
+        }
+      }
+    };
 
-    // Handle resize
     const resizeCanvas = () => {
       const rect = canvas.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return;
+
+      let tempUrl = '';
+      if (!isEmptyRef.current) {
+        tempUrl = canvas.toDataURL();
+      }
+      
       canvas.width = rect.width;
       canvas.height = rect.height;
-      // Reset context after resize
+      
       ctx.strokeStyle = '#000';
       ctx.lineWidth = 2;
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
 
-      // Redraw initial value if exists
-      if (initialValue) {
+      if (tempUrl) {
         const img = new Image();
         img.onload = () => {
           ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
         };
-        img.src = initialValue;
+        img.src = tempUrl;
       }
     };
 
-    resizeCanvas();
+    loadInitialValue();
+    
     window.addEventListener('resize', resizeCanvas);
     return () => window.removeEventListener('resize', resizeCanvas);
-  }, [initialValue]);
+  }, [initialValue]); // Re-run if initialValue changes
 
   const getCoordinates = (e: React.MouseEvent | React.TouchEvent) => {
     const canvas = canvasRef.current;
@@ -120,7 +159,7 @@ export const SignaturePad: React.FC<SignaturePadProps> = ({ onSave, label, initi
           </button>
         )}
       </div>
-      <div className="relative aspect-[3/1] bg-white border border-black/10 rounded-2xl overflow-hidden cursor-crosshair touch-none">
+      <div className="relative aspect-[3/1] bg-white signature-canvas-box border border-black/10 rounded-2xl overflow-hidden cursor-crosshair touch-none">
         <canvas
           ref={canvasRef}
           onMouseDown={startDrawing}
