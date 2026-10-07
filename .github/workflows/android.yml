@@ -1,0 +1,62 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - run: npm ci
+
+      - name: Compilar la web
+        run: npx vite build
+        env:
+          VITE_API_URL: ${{ secrets.VITE_API_URL }}
+
+      - name: Crear proyecto Android si no existe
+        run: |
+          if [ ! -d android ]; then npx cap add android; fi
+
+      - name: Permisos de cámara y micrófono
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path('android/app/src/main/AndroidManifest.xml')
+          s = p.read_text()
+          add = ''
+          for perm in ['ACCESS_NETWORK_STATE', 'CAMERA', 'RECORD_AUDIO']:
+              if f'android.permission.{perm}"' not in s:
+                  add += f'    <uses-permission android:name="android.permission.{perm}" />\n'
+          if 'android.hardware.camera"' not in s:
+              add += '    <uses-feature android:name="android.hardware.camera" android:required="false" />\n'
+          p.write_text(s.replace('</manifest>', add + '</manifest>'))
+          PY
+
+      - run: npx cap sync android
+
+      - name: Aceptar licencias del SDK
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Compilar APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CheckInventory-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
