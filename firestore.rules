@@ -129,6 +129,34 @@ service cloud.firestore {
                      getUserData().email == resource.data.adminEmail);
     }
 
+    // Fotos: un documento por foto (inventories/{id}/photos/{photoId})
+    match /inventories/{inventoryId}/photos/{photoId} {
+      function parentInv() {
+        return get(/databases/$(database)/documents/inventories/$(inventoryId)).data;
+      }
+      function canManagePhotos() {
+        return isAuthenticated() &&
+               (request.auth.uid == parentInv().createdBy ||
+                getUserData().email == parentInv().adminEmail);
+      }
+      function isValidPhoto(data) {
+        return data.dataUrl is string && data.dataUrl.size() < 950000 &&
+               data.timestamp is number &&
+               data.createdBy == request.auth.uid &&
+               (('spaceId' in data) != ('annexId' in data));
+      }
+
+      // Lectura pública si el inventario está firmado (enlace de descarga del PDF)
+      allow read: if parentInv().status == 'completed' || canManagePhotos();
+
+      // Inventario firmado: solo se pueden agregar fotos de anexos
+      allow create, update: if canManagePhotos() &&
+                            isValidPhoto(request.resource.data) &&
+                            (parentInv().status == 'draft' || 'annexId' in request.resource.data);
+
+      allow delete: if canManagePhotos();
+    }
+
     match /test/connection {
       allow read: if true;
     }

@@ -5,39 +5,91 @@
       "description": "User profile and role information",
       "type": "object",
       "properties": {
-        "email": { "type": "string", "format": "email" },
-        "role": { "type": "string", "enum": ["admin", "dependent"] },
-        "adminEmail": { "type": "string", "format": "email", "description": "Email of the admin if role is dependent" }
+        "email": {
+          "type": "string",
+          "format": "email"
+        },
+        "role": {
+          "type": "string",
+          "enum": [
+            "admin",
+            "dependent"
+          ]
+        },
+        "adminEmail": {
+          "type": "string",
+          "format": "email",
+          "description": "Email of the admin if role is dependent"
+        }
       },
-      "required": ["email", "role"]
+      "required": [
+        "email",
+        "role"
+      ]
     },
     "Inventory": {
       "title": "Inventory",
       "description": "Property inventory record",
       "type": "object",
       "properties": {
-        "propertyName": { "type": "string" },
-        "address": { "type": "string" },
-        "date": { "type": "string" },
-        "status": { "type": "string", "enum": ["draft", "completed"] },
-        "createdBy": { "type": "string", "description": "UID of the user who created it" },
-        "adminEmail": { "type": "string", "description": "Email of the admin responsible for this inventory" },
+        "propertyName": {
+          "type": "string"
+        },
+        "address": {
+          "type": "string"
+        },
+        "date": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "draft",
+            "completed"
+          ]
+        },
+        "createdBy": {
+          "type": "string",
+          "description": "UID of the user who created it"
+        },
+        "adminEmail": {
+          "type": "string",
+          "description": "Email of the admin responsible for this inventory"
+        },
         "annexes": {
           "type": "array",
           "items": {
             "type": "object",
             "properties": {
-              "id": { "type": "string" },
-              "text": { "type": "string" },
-              "photos": { "type": "array" },
-              "createdAt": { "type": "number" },
-              "createdBy": { "type": "string" },
-              "creatorName": { "type": "string" }
+              "id": {
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              },
+              "photos": {
+                "type": "array"
+              },
+              "createdAt": {
+                "type": "number"
+              },
+              "createdBy": {
+                "type": "string"
+              },
+              "creatorName": {
+                "type": "string"
+              }
             }
           }
         }
       },
-      "required": ["propertyName", "address", "date", "status", "createdBy"]
+      "required": [
+        "propertyName",
+        "address",
+        "date",
+        "status",
+        "createdBy"
+      ]
     }
   },
   "firestore": {
@@ -48,6 +100,9 @@
     "inventories/{inventoryId}": {
       "schema": "Inventory",
       "description": "Inventory records"
+    },
+    "inventories/{inventoryId}/photos/{photoId}": {
+      "description": "Una foto por documento (dataUrl JPEG comprimido, timestamp, spaceId o annexId, createdBy)"
     }
   }
 }
