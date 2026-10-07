@@ -37,7 +37,11 @@ import { format } from 'date-fns';
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import JSZip from 'jszip';
-import { saveAs } from 'file-saver';
+import { saveFile, saveZip, isNative, nativeListen, API_BASE, webOrigin } from './native';
+import {
+  persistPhoto, removePhotoDoc, deleteAllPhotos, subscribePhotos, fetchPhotos,
+  applyPhotoSnapshot, stripPhotos, queued, type PhotoTarget
+} from './photos';
 import { Inventory, InventorySpace, InventoryItem, Photo, User, Annex } from './types';
 import { SignaturePad } from './components/SignaturePad';
 import { Auth } from './components/Auth';
@@ -290,7 +294,9 @@ export default function App() {
     setTimeout(() => setNotification(null), 3000);
   };
 
-  const downloadPhotosZip = async (inventory: Inventory) => {
+  const downloadPhotosZip = async (inventorySource: Inventory) => {
+    // Las fotos ya no vienen dentro del inventario: se leen de su subcolección
+    const inventory = applyPhotoSnapshot(inventorySource, await fetchPhotos(inventorySource.id), new Set());
     const zip = new JSZip();
     const propertyFolder = zip.folder(`Fotos_${inventory.propertyName.replace(/\s+/g, '_')}`);
     
@@ -330,8 +336,7 @@ export default function App() {
       }
     }
 
-    const content = await zip.generateAsync({ type: 'blob' });
-    saveAs(content, `Fotos_Inventario_${inventory.propertyName.replace(/\s+/g, '_')}.zip`);
+    await saveZip(zip, `Fotos_Inventario_${inventory.propertyName.replace(/\s+/g, '_')}.zip`);
     showNotify('Fotos descargadas correctamente');
   };
 
@@ -339,7 +344,25 @@ export default function App() {
     setShowConfirm({ show: true, title, message, onConfirm });
   };
 
-  const startListening = (spaceIndex: number, itemIndex: number, itemId: string) => {
+  const startListening = async (spaceIndex: number, itemIndex: number, itemId: string) => {
+    if (isNative) {
+      try {
+        setIsListening(itemId);
+        const transcript = await nativeListen('es-ES');
+        if (transcript && currentInventory) {
+          const updated = [...currentInventory.spaces];
+          const currentDetails = updated[spaceIndex].items[itemIndex].details;
+          updated[spaceIndex].items[itemIndex].details = currentDetails ? `${currentDetails} ${transcript}` : transcript;
+          setCurrentInventory({...currentInventory, spaces: updated});
+          showNotify('Texto dictado añadido');
+        }
+      } catch (e: any) {
+        showNotify(e?.message === 'not-allowed' ? 'Permiso de micrófono denegado' : 'Dictado por voz no disponible', 'error');
+      } finally {
+        setIsListening(null);
+      }
+      return;
+    }
     const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     
     if (!SpeechRecognition) {
@@ -390,21 +413,106 @@ export default function App() {
     }
   };
 
+  // ---- Fotos: cada foto es un documento propio (inventories/{id}/photos/{photoId}) ----
+  const persistedIdsRef = useRef<Set<string>>(new Set());          // fotos ya enviadas a Firestore
+  const ensuredRef = useRef<Map<string, Promise<void>>>(new Map()); // borradores creados automáticamente
+  const photosSyncedRef = useRef<Set<string>>(new Set());          // inventarios con fotos ya cargadas del servidor
+
+  const currentInvId = currentInventory?.id;
+  const parentExists = !!currentInvId && inventories.some(i => i.id === currentInvId);
+
+  // Carga y escucha las fotos del inventario abierto (primero caché local, luego servidor)
+  useEffect(() => {
+    if (!currentInvId || !parentExists) return;
+    const invId = currentInvId;
+    const unsubscribe = subscribePhotos(
+      invId,
+      (docs, fromCache) => {
+        if (!fromCache || !navigator.onLine) photosSyncedRef.current.add(invId);
+        setCurrentInventory(prev =>
+          prev && prev.id === invId ? applyPhotoSnapshot(prev, docs, persistedIdsRef.current) : prev
+        );
+      },
+      (err) => console.warn('No se pudieron leer las fotos', err)
+    );
+    return unsubscribe;
+  }, [currentInvId, parentExists]);
+
+  const writeInventoryDoc = async (inventory: Inventory, exists: boolean, keepEmbedded?: Set<string>, photoCount = 0) => {
+    const { id, ...data } = stripPhotos(inventory, { photoCount, keepEmbedded });
+    if (!exists) {
+      await queued(setDoc(doc(db, 'inventories', id), {
+        ...data,
+        createdBy: currentUser?.id,
+        creatorName: `${currentUser?.firstName} ${currentUser?.lastName}`.trim(),
+        adminEmail: currentUser?.role === 'admin' ? currentUser.email : currentUser?.adminEmail
+      }));
+    } else {
+      await queued(updateDoc(doc(db, 'inventories', id), data));
+    }
+  };
+
+  // Un inventario nuevo debe existir en la nube para poder guardar sus fotos al instante
+  const ensureInventoryDoc = (inv: Inventory): Promise<void> => {
+    if (inventories.some(i => i.id === inv.id)) return Promise.resolve();
+    let p = ensuredRef.current.get(inv.id);
+    if (!p) {
+      const draft: Inventory = { ...inv, propertyName: inv.propertyName.trim() || 'Borrador sin nombre', status: 'draft' };
+      p = writeInventoryDoc(draft, false).catch(err => {
+        ensuredRef.current.delete(inv.id);
+        throw err;
+      });
+      ensuredRef.current.set(inv.id, p);
+    }
+    return p;
+  };
+
+  // Guarda una foto recién tomada (funciona sin internet: queda en cola y se sube sola)
+  const persistCapturedPhoto = async (inv: Inventory, photo: Photo, target: PhotoTarget) => {
+    if (!currentUser) return;
+    try {
+      await ensureInventoryDoc(inv);
+      persistedIdsRef.current.add(photo.id);
+      await queued(persistPhoto(inv.id, photo, target, currentUser.id), 800);
+    } catch (err) {
+      persistedIdsRef.current.delete(photo.id);
+      console.error(err);
+      showNotify('No se pudo guardar una foto; se reintentará al guardar el inventario', 'error');
+    }
+  };
+
+  // Fotos antiguas que venían dentro del documento: se pasan a la subcolección.
+  // Si alguna falla, se deja incrustada para no perderla.
+  const migrateLegacyPhotos = async (inventory: Inventory): Promise<Set<string>> => {
+    const failed = new Set<string>();
+    if (!currentUser) return failed;
+    const jobs: Promise<void>[] = [];
+    const enqueue = (p: Photo, target: PhotoTarget) => {
+      if (persistedIdsRef.current.has(p.id)) return;
+      persistedIdsRef.current.add(p.id);
+      jobs.push(
+        queued(persistPhoto(inventory.id, p, target, currentUser.id)).then(
+          () => undefined,
+          (err) => { console.error(err); persistedIdsRef.current.delete(p.id); failed.add(p.id); }
+        )
+      );
+    };
+    inventory.spaces.forEach(sp => (sp.photos || []).forEach(p => enqueue(p, { spaceId: sp.id })));
+    (inventory.annexes || []).forEach(a => (a.photos || []).forEach(p => enqueue(p, { annexId: a.id })));
+    await Promise.all(jobs);
+    return failed;
+  };
+
   const saveInventory = async (inventory: Inventory) => {
     try {
-      const { id, ...data } = inventory;
-      const exists = inventories.find(i => i.id === id);
-      
-      if (!exists) {
-        await setDoc(doc(db, 'inventories', id), {
-          ...data,
-          createdBy: currentUser?.id,
-          creatorName: `${currentUser?.firstName} ${currentUser?.lastName}`.trim(),
-          adminEmail: currentUser?.role === 'admin' ? currentUser.email : currentUser?.adminEmail
-        });
-      } else {
-        await updateDoc(doc(db, 'inventories', id), data);
-      }
+      const exists = inventories.some(i => i.id === inventory.id) || ensuredRef.current.has(inventory.id);
+      const keepEmbedded = await migrateLegacyPhotos(inventory);
+      const inMemory = inventory.spaces.reduce((acc, sp) => acc + sp.photos.length, 0);
+      // Si las fotos aún no terminaron de cargar, no se pisa el contador guardado
+      const photoCount = photosSyncedRef.current.has(inventory.id) || !exists
+        ? inMemory
+        : (inventory.photoCount ?? inMemory);
+      await writeInventoryDoc(inventory, exists, keepEmbedded, photoCount);
       showNotify('Inventario guardado correctamente');
     } catch (error) {
       handleFirestoreError(error, OperationType.WRITE, `inventories/${inventory.id}`);
@@ -535,7 +643,7 @@ export default function App() {
     
     if (targetEmail) {
       try {
-        const response = await fetch('/api/send-verification', {
+        const response = await fetch(`${API_BASE}/api/send-verification`, {
           method: 'POST',
           headers: { 
             'Content-Type': 'application/json'
@@ -570,7 +678,8 @@ export default function App() {
   const verifyAndDelete = async () => {
     if (deleteCodeInput === generatedDeleteCode && inventoryIdToDelete) {
       try {
-        await deleteDoc(doc(db, 'inventories', inventoryIdToDelete));
+        await deleteAllPhotos(inventoryIdToDelete);
+        await queued(deleteDoc(doc(db, 'inventories', inventoryIdToDelete)));
         showNotify('Inventario eliminado correctamente');
         setShowDeleteCodeModal(false);
         setInventoryIdToDelete(null);
@@ -658,6 +767,7 @@ export default function App() {
   const handlePhotoCapture = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || !currentInventory || !targetSpaceId) return;
+    const invAtCapture = currentInventory;
 
     Array.from(files).forEach((file: File) => {
       const reader = new FileReader();
@@ -708,6 +818,7 @@ export default function App() {
               })
             };
           });
+          void persistCapturedPhoto(invAtCapture, newPhoto, { spaceId: targetSpaceId });
         };
         img.src = reader.result as string;
       };
@@ -719,6 +830,9 @@ export default function App() {
 
   const removePhoto = (spaceId: string, photoId: string) => {
     if (!currentInventory) return;
+    if (persistedIdsRef.current.has(photoId)) {
+      removePhotoDoc(currentInventory.id, photoId).catch(err => console.error(err));
+    }
     const updatedSpaces = currentInventory.spaces.map(s => {
       if (s.id === spaceId) {
         return { ...s, photos: s.photos.filter(p => p.id !== photoId) };
@@ -741,6 +855,7 @@ export default function App() {
         id: uuidv4(),
         text: annexText,
         photos: annexPhotos,
+        photoCount: annexPhotos.length,
         createdAt: Date.now(),
         createdBy: currentUser.id,
         creatorName: `${currentUser.firstName} ${currentUser.lastName}`
@@ -749,9 +864,22 @@ export default function App() {
       const updatedAnnexes = [...(currentInventory.annexes || []), newAnnex];
       const inventoryRef = doc(db, 'inventories', currentInventory.id);
       
-      await updateDoc(inventoryRef, {
-        annexes: updatedAnnexes
+      annexPhotos.forEach(p => {
+        persistedIdsRef.current.add(p.id);
+        queued(persistPhoto(currentInventory.id, p, { annexId: newAnnex.id }, currentUser.id)).catch(err => {
+          persistedIdsRef.current.delete(p.id);
+          console.error(err);
+        });
       });
+
+      const lightAnnexes = updatedAnnexes.map(a => ({
+        ...a,
+        photoCount: Math.max(a.photos?.length ?? 0, a.photoCount ?? 0),
+        photos: [] as Photo[]
+      }));
+      await queued(updateDoc(inventoryRef, {
+        annexes: lightAnnexes
+      }));
 
       setCurrentInventory({
         ...currentInventory,
@@ -759,7 +887,7 @@ export default function App() {
       });
 
       setInventories(prev => prev.map(inv => 
-        inv.id === currentInventory.id ? { ...inv, annexes: updatedAnnexes } : inv
+        inv.id === currentInventory.id ? { ...inv, annexes: lightAnnexes } : inv
       ));
 
       setAnnexText('');
@@ -824,7 +952,7 @@ export default function App() {
     setAnnexPhotos(prev => prev.filter(p => p.id !== photoId));
   };
 
-  const exportToPDF = (inventory: Inventory, recipient: 'owner' | 'tenant' | 'both' = 'both') => {
+  const exportToPDF = async (inventory: Inventory, recipient: 'owner' | 'tenant' | 'both' = 'both') => {
     const doc = new jsPDF();
     const pageWidth = doc.internal.pageSize.getWidth();
     
@@ -889,7 +1017,7 @@ export default function App() {
     doc.text(splitText, 14, currentY);
     currentY += (splitText.length * 6) + 5;
 
-    const downloadUrl = `${window.location.origin}/?downloadPhotos=${inventory.id}`;
+    const downloadUrl = `${webOrigin()}/?downloadPhotos=${inventory.id}`;
     doc.setFontSize(12);
     doc.setFont('helvetica', 'bold');
     doc.setTextColor(0, 0, 255); // Blue color for link
@@ -974,10 +1102,11 @@ export default function App() {
           doc.text(annexText, 14, currentY);
           currentY += (annexText.length * 5) + 5;
 
-          if (annex.photos && annex.photos.length > 0) {
+          const annexPhotoTotal = annex.photoCount ?? annex.photos?.length ?? 0;
+          if (annexPhotoTotal > 0) {
             doc.setFontSize(9);
             doc.setFont('helvetica', 'italic');
-            doc.text(`(Este anexo incluye ${annex.photos.length} fotos adicionales en el registro digital)`, 14, currentY);
+            doc.text(`(Este anexo incluye ${annexPhotoTotal} fotos adicionales en el registro digital)`, 14, currentY);
             currentY += 10;
           }
           
@@ -987,7 +1116,7 @@ export default function App() {
         });
       }
 
-      doc.save(`Inventario_${inventory.propertyName.replace(/\s+/g, '_')}_${inventory.date}${suffix}.pdf`);
+      await saveFile(doc.output('blob'), `Inventario_${inventory.propertyName.replace(/\s+/g, '_')}_${inventory.date}${suffix}.pdf`);
   };
 
   const filteredInventories = inventories.filter(inv => {
@@ -1073,7 +1202,7 @@ export default function App() {
                 if (auth.currentUser) {
                   try {
                     await sendEmailVerification(auth.currentUser, {
-                      url: window.location.origin,
+                      url: webOrigin(),
                       handleCodeInApp: false,
                     });
                     showNotify('Enlace de verificación reenviado.');
@@ -1370,7 +1499,7 @@ export default function App() {
                     {annexPhotos.map((photo) => (
                       <div key={photo.id} className="relative aspect-square group">
                         <img 
-                          src={photo.dataUrl} 
+                          src={photo.dataUrl} loading="lazy" decoding="async" 
                           alt="Anexo" 
                           className="w-full h-full object-cover rounded-xl border border-black/5"
                           referrerPolicy="no-referrer"
@@ -1646,7 +1775,7 @@ export default function App() {
                         <div className="flex justify-between items-start mb-4">
                           <div className="flex gap-2">
                             <div className="bg-black/5 px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider text-black/60">
-                              {inv.spaces.reduce((acc, s) => acc + s.photos.length, 0)} Fotos
+                              {inv.photoCount ?? inv.spaces.reduce((acc, s) => acc + (s.photos?.length || 0), 0)} Fotos
                             </div>
                             <div className={`px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider ${
                               inv.status === 'completed' ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'
@@ -2078,7 +2207,7 @@ export default function App() {
                                 {space.photos.map((photo) => (
                                   <div key={photo.id} className="aspect-square rounded-2xl overflow-hidden border border-black/5 group/photo relative">
                                     <img 
-                                      src={photo.dataUrl} 
+                                      src={photo.dataUrl} loading="lazy" decoding="async" 
                                       alt="Evidencia" 
                                       className="w-full h-full object-cover transition-transform duration-500 group-hover/photo:scale-110"
                                       referrerPolicy="no-referrer"
@@ -2158,7 +2287,7 @@ export default function App() {
                                   {annex.photos.map((photo) => (
                                     <div key={photo.id} className="aspect-square rounded-xl overflow-hidden border border-black/5">
                                       <img 
-                                        src={photo.dataUrl} 
+                                        src={photo.dataUrl} loading="lazy" decoding="async" 
                                         alt="Anexo" 
                                         className="w-full h-full object-cover"
                                         referrerPolicy="no-referrer"
@@ -2533,7 +2662,7 @@ export default function App() {
                                   {space.photos.map((photo) => (
                                     <div key={photo.id} className="relative group aspect-square rounded-xl overflow-hidden border border-black/5 shadow-sm">
                                       <img 
-                                        src={photo.dataUrl} 
+                                        src={photo.dataUrl} loading="lazy" decoding="async" 
                                         alt="Evidencia" 
                                         className="w-full h-full object-cover"
                                         referrerPolicy="no-referrer"

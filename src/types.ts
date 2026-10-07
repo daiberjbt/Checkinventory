@@ -38,6 +38,7 @@ export interface Annex {
   createdAt: number;
   createdBy: string;
   creatorName: string;
+  photoCount?: number; // las fotos viven en inventories/{id}/photos
 }
 
 export type PropertyType = 'Apartamento' | 'Oficina' | 'Local' | 'Bodega' | 'Otro';
@@ -62,4 +63,5 @@ export interface Inventory {
   createdBy: string;
   creatorName: string;
   adminEmail: string;
+  photoCount?: number; // total de fotos de espacios (las fotos viven en inventories/{id}/photos)
 }
