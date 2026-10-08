@@ -177,6 +177,20 @@ if (isNative) {
     }) as typeof window.fetch;
   }
 
+  // 1b) Los servidores gratuitos (Render) se duermen tras 15 min sin uso y tardan ~1 min en despertar:
+  //     se les avisa al abrir la app y al volver a ella, para que ya esten listos cuando se necesiten.
+  if (API_BASE) {
+    const wake = () => { fetch(`${API_BASE}/api/health`, { cache: 'no-store' }).catch(() => {}); };
+    let lastWake = Date.now();
+    wake();
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && Date.now() - lastWake > 10 * 60 * 1000) {
+        lastWake = Date.now();
+        wake();
+      }
+    });
+  }
+
   // 2) navigator.share / canShare no existen en el WebView: se reemplazan por el menu nativo de Android
   const nav = navigator as any;
   nav.canShare = () => true;
