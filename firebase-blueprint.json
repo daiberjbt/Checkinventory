@@ -87,7 +87,12 @@
         "tenantSignedActSent": { "type": "boolean" },
         "createdBy": { "type": "string", "description": "UID of the user who created it" },
         "creatorName": { "type": "string" },
-        "adminEmail": { "type": "string", "description": "Email of the admin responsible for this inventory" }
+        "adminEmail": { "type": "string", "description": "Email of the admin responsible for this inventory" },
+        "assignedTo": { "type": "string", "description": "UID of the assigned dependent" },
+        "assignedToName": { "type": "string", "description": "Name of the assigned dependent" },
+        "assignedAt": { "type": "number", "description": "Timestamp when assigned" },
+        "assignedBy": { "type": "string", "description": "UID of the admin who assigned" },
+        "assignmentHistory": { "type": "array", "description": "Audit history of assignments" }
       },
       "required": ["propertyName", "address", "date", "status", "createdBy", "adminEmail", "createdAt", "spaces"]
     },

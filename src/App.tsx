@@ -62,7 +62,8 @@ import {
   ExternalLink,
   Globe,
   Smartphone,
-  Link2
+  Link2,
+  UserCheck
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { v4 as uuidv4 } from 'uuid';
@@ -95,7 +96,8 @@ import {
   limit,
   setDoc,
   writeBatch,
-  getDocFromServer
+  getDocFromServer,
+  arrayUnion
 } from 'firebase/firestore';
 import { ref, uploadBytesResumable, getDownloadURL, deleteObject } from 'firebase/storage';
 import ReactQuill from 'react-quill-new';
@@ -344,6 +346,10 @@ export default function App() {
   const [dependents, setDependents] = useState<User[]>([]);
   const [view, setView] = useState<ViewType>('list');
   const [currentInventory, setCurrentInventory] = useState<Inventory | null>(null);
+  const [showAssignModal, setShowAssignModal] = useState(false);
+  const [assigningInventory, setAssigningInventory] = useState<Inventory | null>(null);
+  const [selectedDependentForAssign, setSelectedDependentForAssign] = useState<string | null>(null);
+  const [isAssigning, setIsAssigning] = useState(false);
   const [receptionType, setReceptionType] = useState<'tenant' | 'owner' | null>(null);
   const [receptionText, setReceptionText] = useState('');
   const [receptionSignature, setReceptionSignature] = useState('');
@@ -1511,37 +1517,83 @@ export default function App() {
     }
 
     // Admin sees all inventories they created or where they are the adminEmail
-    // Dependent sees only inventories they created
+    // Dependent sees inventories they created AND inventories assigned to them
     // We limit to 100 most recent to save quota
-    let q;
     if (currentUser.role === 'admin') {
-      q = query(
+      const q = query(
         collection(db, 'inventories'), 
         where('adminEmail', '==', currentUser.email),
         orderBy('updatedAt', 'desc'),
         limit(100)
       );
+
+      const unsubscribe = onSnapshot(q, (snapshot) => {
+        const data = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data()
+        })) as Inventory[];
+        PhotoSyncEngine.getInstance().setPersistedInventories(data.map(d => d.id));
+        setInventories(data);
+      }, (error) => {
+        handleFirestoreError(error, OperationType.LIST, 'inventories');
+      });
+
+      return unsubscribe;
     } else {
-      q = query(
+      let createdList: Inventory[] = [];
+      let assignedList: Inventory[] = [];
+
+      const updateMergedList = () => {
+        const map = new Map<string, Inventory>();
+        for (const inv of createdList) {
+          map.set(inv.id, inv);
+        }
+        for (const inv of assignedList) {
+          map.set(inv.id, inv);
+        }
+        const merged = Array.from(map.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+        PhotoSyncEngine.getInstance().setPersistedInventories(merged.map(d => d.id));
+        setInventories(merged);
+      };
+
+      const qCreated = query(
         collection(db, 'inventories'), 
         where('createdBy', '==', currentUser.id),
         orderBy('updatedAt', 'desc'),
         limit(100)
       );
+
+      const qAssigned = query(
+        collection(db, 'inventories'), 
+        where('assignedTo', '==', currentUser.id),
+        limit(100)
+      );
+
+      const unsubCreated = onSnapshot(qCreated, (snapshot) => {
+        createdList = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data()
+        })) as Inventory[];
+        updateMergedList();
+      }, (error) => {
+        handleFirestoreError(error, OperationType.LIST, 'inventories');
+      });
+
+      const unsubAssigned = onSnapshot(qAssigned, (snapshot) => {
+        assignedList = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data()
+        })) as Inventory[];
+        updateMergedList();
+      }, (error) => {
+        handleFirestoreError(error, OperationType.LIST, 'inventories');
+      });
+
+      return () => {
+        unsubCreated();
+        unsubAssigned();
+      };
     }
-
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const data = snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      })) as Inventory[];
-      PhotoSyncEngine.getInstance().setPersistedInventories(data.map(d => d.id));
-      setInventories(data);
-    }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, 'inventories');
-    });
-
-    return unsubscribe;
   }, [currentUser?.id, currentUser?.email, currentUser?.role, isAuthReady]);
 
   const notificationTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -1718,7 +1770,15 @@ export default function App() {
     try {
       const cleanInventory = sanitizeInventory(inventory);
       const inventoryId = cleanInventory.id || uuidv4();
-      const { id: _, ...data } = cleanInventory;
+      const { 
+        id: _, 
+        assignedTo: _assignedTo,
+        assignedToName: _assignedToName,
+        assignedAt: _assignedAt,
+        assignedBy: _assignedBy,
+        assignmentHistory: _assignmentHistory,
+        ...data 
+      } = cleanInventory;
       
       // Check for internalCode uniqueness among non-archived inventories (only if provided and not empty)
       if (data.internalCode && typeof data.internalCode === 'string' && data.internalCode.trim() !== '') {
@@ -2255,6 +2315,80 @@ export default function App() {
       }
     } else {
       showNotify('Código de verificación incorrecto', 'error');
+    }
+  };
+
+  const handleConfirmAssignment = async () => {
+    if (!assigningInventory || !selectedDependentForAssign || !currentUser) return;
+    const dep = dependents.find(d => d.id === selectedDependentForAssign);
+    if (!dep) {
+      showNotify('Dependiente no encontrado', 'error');
+      return;
+    }
+    const fullName = `${dep.firstName || ''} ${dep.lastName || ''}`.trim() || dep.email;
+    const byName = `${currentUser.firstName || ''} ${currentUser.lastName || ''}`.trim() || currentUser.email || 'Admin';
+    const now = Date.now();
+
+    setIsAssigning(true);
+    try {
+      const invRef = doc(db, 'inventories', assigningInventory.id);
+      await updateDoc(invRef, {
+        assignedTo: dep.id,
+        assignedToName: fullName,
+        assignedAt: now,
+        assignedBy: currentUser.id,
+        updatedAt: now,
+        assignmentHistory: arrayUnion({
+          to: dep.id,
+          toName: fullName,
+          by: currentUser.id,
+          byName: byName,
+          at: now
+        })
+      });
+
+      showNotify(`Inventario asignado a ${fullName}`, 'success');
+      setShowAssignModal(false);
+      setAssigningInventory(null);
+    } catch (error) {
+      console.error('Error assigning inventory:', error);
+      showNotify('Error al asignar el inventario', 'error');
+      handleFirestoreError(error, OperationType.UPDATE, `inventories/${assigningInventory.id}`);
+    } finally {
+      setIsAssigning(false);
+    }
+  };
+
+  const handleRemoveAssignment = async (inv: Inventory) => {
+    if (!currentUser) return;
+    const byName = `${currentUser.firstName || ''} ${currentUser.lastName || ''}`.trim() || currentUser.email || 'Admin';
+    const now = Date.now();
+
+    setIsAssigning(true);
+    try {
+      const invRef = doc(db, 'inventories', inv.id);
+      await updateDoc(invRef, {
+        assignedTo: null,
+        assignedToName: null,
+        updatedAt: now,
+        assignmentHistory: arrayUnion({
+          to: null,
+          toName: null,
+          by: currentUser.id,
+          byName: byName,
+          at: now
+        })
+      });
+
+      showNotify('Asignación eliminada correctamente', 'success');
+      setShowAssignModal(false);
+      setAssigningInventory(null);
+    } catch (error) {
+      console.error('Error removing assignment:', error);
+      showNotify('Error al quitar la asignación', 'error');
+      handleFirestoreError(error, OperationType.UPDATE, `inventories/${inv.id}`);
+    } finally {
+      setIsAssigning(false);
     }
   };
 
@@ -3612,7 +3746,7 @@ export default function App() {
               {/* Modal Content */}
               <div className="flex-1 overflow-y-auto p-8">
                 {(() => {
-                  const dependentInventories = inventories.filter(inv => inv.createdBy === selectedDependentForInventories.id);
+                  const dependentInventories = inventories.filter(inv => inv.createdBy === selectedDependentForInventories.id || inv.assignedTo === selectedDependentForInventories.id);
                   
                   if (dependentInventories.length === 0) {
                     return (
@@ -4213,6 +4347,150 @@ export default function App() {
         )}
       </AnimatePresence>
 
+      {/* Assign Inventory Modal */}
+      <AnimatePresence>
+        {showAssignModal && assigningInventory && currentUser?.role === 'admin' && (
+          <div className="fixed inset-0 z-[110] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => {
+                if (!isAssigning) {
+                  setShowAssignModal(false);
+                  setAssigningInventory(null);
+                }
+              }}
+              className="absolute inset-0 bg-black/60 backdrop-blur-md"
+            />
+            <motion.div 
+              initial={{ y: 50, opacity: 0 }}
+              animate={{ y: 0, opacity: 1 }}
+              exit={{ y: 50, opacity: 0 }}
+              className="bg-white rounded-[3rem] p-8 max-w-lg w-full relative z-10 shadow-2xl border border-black/5 overflow-hidden flex flex-col max-h-[85vh]"
+            >
+              <div className="flex justify-between items-start mb-6">
+                <div>
+                  <h3 className="text-2xl font-bold tracking-tight">Asignar inventario</h3>
+                  <p className="text-muted text-xs font-medium mt-1 truncate max-w-sm">
+                    {assigningInventory.propertyName} {assigningInventory.internalCode ? `(${assigningInventory.internalCode})` : ''}
+                  </p>
+                </div>
+                <button 
+                  onClick={() => {
+                    if (!isAssigning) {
+                      setShowAssignModal(false);
+                      setAssigningInventory(null);
+                    }
+                  }}
+                  disabled={isAssigning}
+                  className="w-10 h-10 rounded-2xl bg-black/5 flex items-center justify-center hover:bg-black/10 transition-all disabled:opacity-50"
+                >
+                  <X size={20} />
+                </button>
+              </div>
+
+              <div className="flex-1 overflow-y-auto space-y-3 pr-1 my-2">
+                {(() => {
+                  const activeDependents = dependents.filter(d => d.isActive !== false && !d.isDeleted);
+                  if (activeDependents.length === 0) {
+                    return (
+                      <div className="py-10 text-center">
+                        <Users size={36} className="mx-auto text-black/20 mb-3" />
+                        <p className="font-bold text-sm">No hay dependientes activos</p>
+                        <p className="text-muted text-xs mt-1">Crea o activa dependientes en el panel de Ajustes antes de asignar.</p>
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div className="space-y-2">
+                      <p className="text-xs font-bold uppercase tracking-widest text-muted mb-2">
+                        Dependientes disponibles:
+                      </p>
+                      {activeDependents.map(dep => {
+                        const isCurrentAssigned = assigningInventory.assignedTo === dep.id;
+                        const isSelected = selectedDependentForAssign === dep.id;
+                        const fullName = `${dep.firstName || ''} ${dep.lastName || ''}`.trim() || dep.email;
+
+                        return (
+                          <div
+                            key={dep.id}
+                            onClick={() => setSelectedDependentForAssign(dep.id)}
+                            className={`p-4 rounded-2xl border transition-all cursor-pointer flex items-center justify-between ${
+                              isSelected
+                                ? 'border-black bg-black/5 shadow-sm'
+                                : 'border-black/5 bg-[#fcfcfc] hover:border-black/20'
+                            }`}
+                          >
+                            <div className="flex items-center gap-3">
+                              <div className="w-10 h-10 bg-black text-white rounded-xl flex items-center justify-center font-bold text-sm">
+                                {(dep.firstName?.[0] || '')}{(dep.lastName?.[0] || '') || 'D'}
+                              </div>
+                              <div>
+                                <div className="flex items-center gap-2">
+                                  <span className="font-bold text-sm text-black">{fullName}</span>
+                                  {isCurrentAssigned && (
+                                    <span className="px-2 py-0.5 rounded text-[8px] font-bold uppercase tracking-widest bg-blue-100 text-blue-700">
+                                      Actual
+                                    </span>
+                                  )}
+                                </div>
+                                <span className="text-xs text-muted">{dep.email}</span>
+                              </div>
+                            </div>
+                            <div className={`w-5 h-5 rounded-full border-2 flex items-center justify-center ${
+                              isSelected ? 'border-black bg-black text-white' : 'border-black/20'
+                            }`}>
+                              {isSelected && <Check size={12} />}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  );
+                })()}
+              </div>
+
+              <div className="pt-6 border-t border-black/5 flex flex-wrap items-center justify-between gap-3 mt-4">
+                {assigningInventory.assignedTo ? (
+                  <button
+                    type="button"
+                    disabled={isAssigning}
+                    onClick={() => handleRemoveAssignment(assigningInventory)}
+                    className="text-xs font-bold text-red-600 hover:text-red-700 py-3 px-3 rounded-xl hover:bg-red-50 transition-colors disabled:opacity-50"
+                  >
+                    Quitar asignación
+                  </button>
+                ) : <div />}
+
+                <div className="flex items-center gap-3 ml-auto">
+                  <button
+                    type="button"
+                    disabled={isAssigning}
+                    onClick={() => {
+                      setShowAssignModal(false);
+                      setAssigningInventory(null);
+                    }}
+                    className="px-5 py-3 rounded-2xl text-xs font-bold text-muted hover:text-black transition-colors disabled:opacity-50"
+                  >
+                    Cancelar
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isAssigning || !selectedDependentForAssign || selectedDependentForAssign === assigningInventory.assignedTo}
+                    onClick={() => handleConfirmAssignment()}
+                    className="px-6 py-3 rounded-2xl text-xs font-bold bg-black text-white hover:bg-black/80 transition-all shadow-md active:scale-95 disabled:opacity-40 disabled:pointer-events-none"
+                  >
+                    {isAssigning ? 'Guardando...' : 'Asignar'}
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
       {/* Delete Verification Modal */}
       <AnimatePresence>
         {showDeleteCodeModal && (
@@ -4616,6 +4894,16 @@ export default function App() {
                           </div>
                         )}
                         
+                        {inv.assignedTo && (
+                          <div className="flex items-center gap-2 mb-3 p-2 bg-blue-50/70 border border-blue-100 rounded-xl text-blue-900">
+                            <UserCheck size={14} className="text-blue-600 shrink-0" />
+                            <p className="text-[10px] font-bold uppercase tracking-widest">
+                              <span className="text-blue-600/70">Asignado a: </span>
+                              <span className="text-blue-950 font-bold">{inv.assignedToName || 'Dependiente'}</span>
+                            </p>
+                          </div>
+                        )}
+                        
                         {currentUser?.role === 'admin' && inv.creatorName && (
                           <div className="flex items-center gap-2 mb-8 p-3 bg-black/5 rounded-2xl">
                             <div className="w-6 h-6 bg-black rounded-lg flex items-center justify-center text-white text-[10px] font-bold">
@@ -4713,6 +5001,22 @@ export default function App() {
                             >
                               <FileText size={14} />
                               Editar
+                            </button>
+                          )}
+
+                          {currentUser?.role === 'admin' && inv.status !== 'archived' && (
+                            <button 
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setAssigningInventory(inv);
+                                setSelectedDependentForAssign(inv.assignedTo || null);
+                                setShowAssignModal(true);
+                              }}
+                              className="text-[10px] font-bold uppercase tracking-widest text-muted hover:text-black transition-colors flex items-center gap-1.5 py-1.5 px-3 bg-black/5 rounded-lg hover:bg-black/10"
+                              title="Asignar a un dependiente"
+                            >
+                              <UserCheck size={14} />
+                              Asignar
                             </button>
                           )}
                         </div>
@@ -5858,8 +6162,8 @@ export default function App() {
                       <div className="space-y-4">
                         <div className="pt-6 border-t border-black/5 flex items-center justify-between">
                           <div className="flex flex-col">
-                            <span className="text-[10px] font-bold uppercase tracking-widest text-muted">Inventarios creados</span>
-                            <span className="text-xl font-bold">{inventories.filter(i => i.createdBy === dep.id).length}</span>
+                            <span className="text-[10px] font-bold uppercase tracking-widest text-muted">Inventarios</span>
+                            <span className="text-xl font-bold">{inventories.filter(i => i.createdBy === dep.id || i.assignedTo === dep.id).length}</span>
                           </div>
                           <div className="w-10 h-10 bg-emerald-50 text-emerald-600 rounded-xl flex items-center justify-center">
                             <ClipboardList size={20} />
@@ -6006,6 +6310,15 @@ export default function App() {
                         <div>
                           <p className="text-[10px] uppercase tracking-widest font-bold opacity-50">Responsable</p>
                           <p className="text-sm text-black">{currentInventory.creatorName}</p>
+                        </div>
+                      </div>
+                    )}
+                    {currentInventory.assignedTo && (
+                      <div className="flex items-center gap-2">
+                        <UserCheck size={18} className="text-blue-600" />
+                        <div>
+                          <p className="text-[10px] uppercase tracking-widest font-bold opacity-50">Asignado a</p>
+                          <p className="text-sm font-bold text-black">{currentInventory.assignedToName || 'Dependiente'}</p>
                         </div>
                       </div>
                     )}

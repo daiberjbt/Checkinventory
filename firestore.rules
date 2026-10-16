@@ -134,7 +134,28 @@ service cloud.firestore {
              (!('tenantRemoteSigned' in data) || data.tenantRemoteSigned == null || data.tenantRemoteSigned is bool) &&
              (!('ownerSignedActSent' in data) || data.ownerSignedActSent == null || data.ownerSignedActSent is bool) &&
              (!('tenantSignedActSent' in data) || data.tenantSignedActSent == null || data.tenantSignedActSent is bool) &&
-             (!('updatedAt' in data) || data.updatedAt == null || (data.updatedAt is number || data.updatedAt is int || (data.updatedAt is string && data.updatedAt.size() < 100)));
+             (!('updatedAt' in data) || data.updatedAt == null || (data.updatedAt is number || data.updatedAt is int || (data.updatedAt is string && data.updatedAt.size() < 100))) &&
+             (!('assignedTo' in data) || data.assignedTo == null || (data.assignedTo is string && data.assignedTo.size() < 128)) &&
+             (!('assignedToName' in data) || data.assignedToName == null || (data.assignedToName is string && data.assignedToName.size() < 200)) &&
+             (!('assignedAt' in data) || data.assignedAt == null || (data.assignedAt is number || data.assignedAt is int)) &&
+             (!('assignedBy' in data) || data.assignedBy == null || (data.assignedBy is string && data.assignedBy.size() < 128)) &&
+             (!('assignmentHistory' in data) || data.assignmentHistory == null || (data.assignmentHistory is list && data.assignmentHistory.size() < 200));
+    }
+
+    function assignmentUnchanged() {
+      return request.resource.data.get('assignedTo','') == resource.data.get('assignedTo','') &&
+        request.resource.data.get('assignedToName','') == resource.data.get('assignedToName','') &&
+        request.resource.data.get('assignedAt',0) == resource.data.get('assignedAt',0) &&
+        request.resource.data.get('assignedBy','') == resource.data.get('assignedBy','') &&
+        request.resource.data.get('assignmentHistory',[]) == resource.data.get('assignmentHistory',[]);
+    }
+
+    function canManageAssignment() {
+      return isSuperAdmin() || (isAdmin() &&
+        resource.data.get('adminEmail','') == request.auth.token.get('email','') &&
+        (request.resource.data.get('assignedTo', null) == null ||
+         (exists(/databases/$(database)/documents/users/$(request.resource.data.assignedTo)) &&
+          get(/databases/$(database)/documents/users/$(request.resource.data.assignedTo)).data.get('adminEmail','') == resource.data.get('adminEmail',''))));
     }
 
     // ===============================================================
@@ -228,13 +249,15 @@ service cloud.firestore {
       // Zero public read: must be authenticated and belong to the agency tenant
       allow get: if isAuthenticated() && isUserActive() && (
                     isSuperAdmin() ||
-                    isUserInSameAgency(resource.data.get('adminEmail', ''), resource.data.get('createdBy', ''))
+                    isUserInSameAgency(resource.data.get('adminEmail', ''), resource.data.get('createdBy', '')) ||
+                    resource.data.get('assignedTo', '') == request.auth.uid
                   );
 
       // Multi-tenant query enforcement
       allow list: if isAuthenticated() && isUserActive() && (
                     isSuperAdmin() ||
-                    isUserInSameAgency(resource.data.get('adminEmail', ''), resource.data.get('createdBy', ''))
+                    isUserInSameAgency(resource.data.get('adminEmail', ''), resource.data.get('createdBy', '')) ||
+                    resource.data.get('assignedTo', '') == request.auth.uid
                   );
       
       allow create: if isAuthenticated() && 
@@ -255,6 +278,7 @@ service cloud.firestore {
                       isSuperAdmin() ||
                       isUserInSameAgency(resource.data.get('adminEmail', ''), resource.data.get('createdBy', ''))
                     ) &&
+                    (assignmentUnchanged() || canManageAssignment()) &&
                     (
                       isSuperAdmin() ||
                       // Draft inventories can be fully edited

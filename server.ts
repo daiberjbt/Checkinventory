@@ -61,6 +61,21 @@ async function startServer() {
     message: { error: 'Demasiadas solicitudes de firma remota. Intente más tarde.' }
   });
 
+  app.use('/api', (req, res, next) => {
+    const origin = req.headers.origin;
+    const allowedOrigins = ['https://localhost', 'http://localhost', 'capacitor://localhost'];
+    if (origin && allowedOrigins.includes(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+      if (req.method === 'OPTIONS') {
+        return res.sendStatus(204);
+      }
+    }
+    next();
+  });
+
   app.use('/api/', globalApiLimiter);
 
   // ===============================================================

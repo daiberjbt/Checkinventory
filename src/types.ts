@@ -100,6 +100,7 @@ export interface Annex {
   id: string;
   text: string;
   photos: Photo[];
+  photoCount?: number;
   createdAt: number;
   createdBy: string;
   creatorName: string;
@@ -149,6 +150,7 @@ export interface Inventory {
   date: string;
   spaces: InventorySpace[];
   annexes?: Annex[];
+  photoCount?: number;
   createdAt: number;
   status: 'draft' | 'completed' | 'archived';
   ownerSignature?: string;
@@ -171,4 +173,9 @@ export interface Inventory {
   creatorName: string;
   adminEmail: string;
   updatedAt?: number;
+  assignedTo?: string | null;
+  assignedToName?: string | null;
+  assignedAt?: number;
+  assignedBy?: string;
+  assignmentHistory?: { to: string | null; toName: string | null; by: string; byName: string; at: number }[];
 }
