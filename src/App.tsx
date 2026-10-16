@@ -346,6 +346,10 @@ export default function App() {
   const [dependents, setDependents] = useState<User[]>([]);
   const [view, setView] = useState<ViewType>('list');
   const [currentInventory, setCurrentInventory] = useState<Inventory | null>(null);
+  const currentInventoryRef = useRef<Inventory | null>(null);
+  useEffect(() => {
+    currentInventoryRef.current = currentInventory;
+  }, [currentInventory]);
   const [showAssignModal, setShowAssignModal] = useState(false);
   const [assigningInventory, setAssigningInventory] = useState<Inventory | null>(null);
   const [selectedDependentForAssign, setSelectedDependentForAssign] = useState<string | null>(null);
@@ -1509,6 +1513,19 @@ export default function App() {
     return unsubscribe;
   }, [currentUser?.email, isAuthReady]);
 
+  const notificationTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  const showNotify = (message: string, type: 'success' | 'error' | 'info' | 'warning' = 'success', duration: number = 3500) => {
+    if (notificationTimeoutRef.current) {
+      clearTimeout(notificationTimeoutRef.current);
+    }
+    setNotification({ show: true, message, type });
+    notificationTimeoutRef.current = setTimeout(() => {
+      setNotification(null);
+      notificationTimeoutRef.current = null;
+    }, duration);
+  };
+
   // Firestore Listener for Inventories
   useEffect(() => {
     if (!currentUser || !isAuthReady) {
@@ -1542,18 +1559,48 @@ export default function App() {
     } else {
       let createdList: Inventory[] = [];
       let assignedList: Inventory[] = [];
+      const prevVisibleIds = new Set<string>();
 
       const updateMergedList = () => {
+        // PhotoSyncEngine.getInstance().setPersistedInventories debe seguir recibiendo TODOS los ids, incluidos los excluidos, para no frenar la subida de fotos pendientes
+        const allIds = Array.from(new Set([...createdList.map(d => d.id), ...assignedList.map(d => d.id)]));
+        PhotoSyncEngine.getInstance().setPersistedInventories(allIds);
+
+        // Al unir los resultados excluye los inventarios de la consulta createdBy que tengan assignedTo con valor distinto de currentUser.id
         const map = new Map<string, Inventory>();
         for (const inv of createdList) {
-          map.set(inv.id, inv);
+          if (!inv.assignedTo || inv.assignedTo === currentUser.id) {
+            map.set(inv.id, inv);
+          }
         }
+        // Los de la consulta assignedTo == currentUser.id siempre se muestran
         for (const inv of assignedList) {
           map.set(inv.id, inv);
         }
-        const merged = Array.from(map.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-        PhotoSyncEngine.getInstance().setPersistedInventories(merged.map(d => d.id));
-        setInventories(merged);
+
+        const visible = Array.from(map.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+        setInventories(visible);
+
+        // Si un dependiente tiene abierto un inventario que acaba de dejar de ser visible para él, ciérralo, vuelve a la lista y muestra showNotify('Este inventario fue asignado a otro dependiente', 'info')
+        if (currentInventoryRef.current) {
+          const openId = currentInventoryRef.current.id;
+          const wasOpenAndBecameInvisible = (
+            createdList.some(inv => inv.id === openId && inv.assignedTo && inv.assignedTo !== currentUser.id) ||
+            (prevVisibleIds.has(openId) && !map.has(openId))
+          );
+
+          if (wasOpenAndBecameInvisible) {
+            setCurrentInventory(null);
+            setView('list');
+            setSignatures({ owner: '', tenant: '' });
+            showNotify('Este inventario fue asignado a otro dependiente', 'info');
+          }
+        }
+
+        prevVisibleIds.clear();
+        for (const inv of visible) {
+          prevVisibleIds.add(inv.id);
+        }
       };
 
       const qCreated = query(
@@ -1595,19 +1642,6 @@ export default function App() {
       };
     }
   }, [currentUser?.id, currentUser?.email, currentUser?.role, isAuthReady]);
-
-  const notificationTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-
-  const showNotify = (message: string, type: 'success' | 'error' | 'info' | 'warning' = 'success', duration: number = 3500) => {
-    if (notificationTimeoutRef.current) {
-      clearTimeout(notificationTimeoutRef.current);
-    }
-    setNotification({ show: true, message, type });
-    notificationTimeoutRef.current = setTimeout(() => {
-      setNotification(null);
-      notificationTimeoutRef.current = null;
-    }, duration);
-  };
 
   const getPhotoDataForZip = async (photo: Photo): Promise<{ type: 'blob', blob: Blob } | { type: 'base64', data: string } | null> => {
     if (photo.localBlobId) {
@@ -2318,8 +2352,29 @@ export default function App() {
     }
   };
 
+  const isAssignable = (inv: Inventory | null | undefined): boolean => {
+    if (!inv) return false;
+    const hasText = (v?: string | null) => Boolean(v && v.trim() !== '');
+    return (
+      inv.status === 'completed' &&
+      hasText(inv.ownerSignature) &&
+      hasText(inv.tenantSignature) &&
+      !hasText(inv.tenantReceiveSignature) &&
+      !hasText(inv.ownerDeliverySignature)
+    );
+  };
+
   const handleConfirmAssignment = async () => {
     if (!assigningInventory || !selectedDependentForAssign || !currentUser) return;
+
+    const latestInv = inventories.find(i => i.id === assigningInventory.id) || assigningInventory;
+    if (!isAssignable(latestInv)) {
+      showNotify('Este inventario ya no puede asignarse porque ya tiene acta de recibido o no está firmado', 'error');
+      setShowAssignModal(false);
+      setAssigningInventory(null);
+      return;
+    }
+
     const dep = dependents.find(d => d.id === selectedDependentForAssign);
     if (!dep) {
       showNotify('Dependiente no encontrado', 'error');
@@ -2361,6 +2416,15 @@ export default function App() {
 
   const handleRemoveAssignment = async (inv: Inventory) => {
     if (!currentUser) return;
+
+    const latestInv = inventories.find(i => i.id === inv.id) || inv;
+    if (!isAssignable(latestInv)) {
+      showNotify('Este inventario ya no puede asignarse porque ya tiene acta de recibido o no está firmado', 'error');
+      setShowAssignModal(false);
+      setAssigningInventory(null);
+      return;
+    }
+
     const byName = `${currentUser.firstName || ''} ${currentUser.lastName || ''}`.trim() || currentUser.email || 'Admin';
     const now = Date.now();
 
@@ -3746,7 +3810,7 @@ export default function App() {
               {/* Modal Content */}
               <div className="flex-1 overflow-y-auto p-8">
                 {(() => {
-                  const dependentInventories = inventories.filter(inv => inv.createdBy === selectedDependentForInventories.id || inv.assignedTo === selectedDependentForInventories.id);
+                  const dependentInventories = inventories.filter(inv => (inv.assignedTo || inv.createdBy) === selectedDependentForInventories.id);
                   
                   if (dependentInventories.length === 0) {
                     return (
@@ -4349,7 +4413,7 @@ export default function App() {
 
       {/* Assign Inventory Modal */}
       <AnimatePresence>
-        {showAssignModal && assigningInventory && currentUser?.role === 'admin' && (
+        {showAssignModal && assigningInventory && currentUser?.role === 'admin' && isAssignable(assigningInventory) && (
           <div className="fixed inset-0 z-[110] flex items-center justify-center p-4">
             <motion.div 
               initial={{ opacity: 0 }}
@@ -4371,7 +4435,9 @@ export default function App() {
             >
               <div className="flex justify-between items-start mb-6">
                 <div>
-                  <h3 className="text-2xl font-bold tracking-tight">Asignar inventario</h3>
+                  <h3 className="text-2xl font-bold tracking-tight">
+                    {assigningInventory.assignedTo ? 'Reasignar inventario' : 'Asignar inventario'}
+                  </h3>
                   <p className="text-muted text-xs font-medium mt-1 truncate max-w-sm">
                     {assigningInventory.propertyName} {assigningInventory.internalCode ? `(${assigningInventory.internalCode})` : ''}
                   </p>
@@ -4453,7 +4519,7 @@ export default function App() {
               </div>
 
               <div className="pt-6 border-t border-black/5 flex flex-wrap items-center justify-between gap-3 mt-4">
-                {assigningInventory.assignedTo ? (
+                {assigningInventory.assignedTo && isAssignable(assigningInventory) ? (
                   <button
                     type="button"
                     disabled={isAssigning}
@@ -4482,7 +4548,7 @@ export default function App() {
                     onClick={() => handleConfirmAssignment()}
                     className="px-6 py-3 rounded-2xl text-xs font-bold bg-black text-white hover:bg-black/80 transition-all shadow-md active:scale-95 disabled:opacity-40 disabled:pointer-events-none"
                   >
-                    {isAssigning ? 'Guardando...' : 'Asignar'}
+                    {isAssigning ? 'Guardando...' : (assigningInventory.assignedTo ? 'Reasignar' : 'Asignar')}
                   </button>
                 </div>
               </div>
@@ -4894,25 +4960,51 @@ export default function App() {
                           </div>
                         )}
                         
-                        {inv.assignedTo && (
-                          <div className="flex items-center gap-2 mb-3 p-2 bg-blue-50/70 border border-blue-100 rounded-xl text-blue-900">
-                            <UserCheck size={14} className="text-blue-600 shrink-0" />
-                            <p className="text-[10px] font-bold uppercase tracking-widest">
-                              <span className="text-blue-600/70">Asignado a: </span>
-                              <span className="text-blue-950 font-bold">{inv.assignedToName || 'Dependiente'}</span>
-                            </p>
+                        {/* Asignación y Creador */}
+                        {currentUser?.role === 'admin' && (
+                          <div className="mb-4 space-y-2">
+                            {inv.creatorName && (
+                              <div className="flex items-center gap-2 p-2.5 bg-black/5 rounded-xl">
+                                <div className="w-5 h-5 bg-black rounded-lg flex items-center justify-center text-white text-[10px] font-bold shrink-0">
+                                  {inv.creatorName[0]}
+                                </div>
+                                <p className="text-[10px] font-bold uppercase tracking-widest opacity-80">
+                                  <span className="text-muted">Creado por: </span>
+                                  <span className="text-black">{inv.creatorName}</span>
+                                </p>
+                              </div>
+                            )}
+                            {inv.assignedTo && (
+                              <div className="flex items-center gap-2 p-2.5 bg-blue-50/70 border border-blue-100 rounded-xl text-blue-900">
+                                <UserCheck size={14} className="text-blue-600 shrink-0" />
+                                <p className="text-[10px] font-bold uppercase tracking-widest">
+                                  <span className="text-blue-600/70">Asignado a: </span>
+                                  <span className="text-blue-950 font-bold">{inv.assignedToName || 'Dependiente'}</span>
+                                </p>
+                              </div>
+                            )}
                           </div>
                         )}
-                        
-                        {currentUser?.role === 'admin' && inv.creatorName && (
-                          <div className="flex items-center gap-2 mb-8 p-3 bg-black/5 rounded-2xl">
-                            <div className="w-6 h-6 bg-black rounded-lg flex items-center justify-center text-white text-[10px] font-bold">
-                              {inv.creatorName[0]}
+
+                        {currentUser?.role === 'dependent' && inv.assignedTo === currentUser.id && (
+                          <div className="mb-4 space-y-2">
+                            {inv.creatorName && (
+                              <div className="flex items-center gap-2 p-2.5 bg-black/5 rounded-xl">
+                                <div className="w-5 h-5 bg-black rounded-lg flex items-center justify-center text-white text-[10px] font-bold shrink-0">
+                                  {inv.creatorName[0]}
+                                </div>
+                                <p className="text-[10px] font-bold uppercase tracking-widest opacity-80">
+                                  <span className="text-muted">Creado por: </span>
+                                  <span className="text-black">{inv.creatorName}</span>
+                                </p>
+                              </div>
+                            )}
+                            <div className="flex items-center gap-2 p-2.5 bg-blue-50/70 border border-blue-100 rounded-xl text-blue-900">
+                              <UserCheck size={14} className="text-blue-600 shrink-0" />
+                              <p className="text-[10px] font-bold uppercase tracking-widest">
+                                <span className="text-blue-950 font-bold">Asignado por el administrador</span>
+                              </p>
                             </div>
-                            <p className="text-[10px] font-bold uppercase tracking-widest opacity-70">
-                              <span className="text-muted">Por: </span>
-                              <span className="text-black">{inv.creatorName}</span>
-                            </p>
                           </div>
                         )}
                         
@@ -5004,7 +5096,7 @@ export default function App() {
                             </button>
                           )}
 
-                          {currentUser?.role === 'admin' && inv.status !== 'archived' && (
+                          {currentUser?.role === 'admin' && isAssignable(inv) && (
                             <button 
                               onClick={(e) => {
                                 e.stopPropagation();
@@ -5013,10 +5105,10 @@ export default function App() {
                                 setShowAssignModal(true);
                               }}
                               className="text-[10px] font-bold uppercase tracking-widest text-muted hover:text-black transition-colors flex items-center gap-1.5 py-1.5 px-3 bg-black/5 rounded-lg hover:bg-black/10"
-                              title="Asignar a un dependiente"
+                              title={inv.assignedTo ? 'Reasignar a un dependiente' : 'Asignar a un dependiente'}
                             >
                               <UserCheck size={14} />
-                              Asignar
+                              {inv.assignedTo ? 'Reasignar' : 'Asignar'}
                             </button>
                           )}
                         </div>
@@ -6163,7 +6255,7 @@ export default function App() {
                         <div className="pt-6 border-t border-black/5 flex items-center justify-between">
                           <div className="flex flex-col">
                             <span className="text-[10px] font-bold uppercase tracking-widest text-muted">Inventarios</span>
-                            <span className="text-xl font-bold">{inventories.filter(i => i.createdBy === dep.id || i.assignedTo === dep.id).length}</span>
+                            <span className="text-xl font-bold">{inventories.filter(i => (i.assignedTo || i.createdBy) === dep.id).length}</span>
                           </div>
                           <div className="w-10 h-10 bg-emerald-50 text-emerald-600 rounded-xl flex items-center justify-center">
                             <ClipboardList size={20} />
@@ -6304,23 +6396,48 @@ export default function App() {
                         </div>
                       </div>
                     )}
-                    {currentUser?.role === 'admin' && currentInventory.creatorName && (
-                      <div className="flex items-center gap-2">
-                        <UserIcon size={18} className="text-black/20" />
-                        <div>
-                          <p className="text-[10px] uppercase tracking-widest font-bold opacity-50">Responsable</p>
-                          <p className="text-sm text-black">{currentInventory.creatorName}</p>
-                        </div>
-                      </div>
+                    {currentUser?.role === 'admin' && (
+                      <>
+                        {currentInventory.creatorName && (
+                          <div className="flex items-center gap-2">
+                            <UserIcon size={18} className="text-black/20" />
+                            <div>
+                              <p className="text-[10px] uppercase tracking-widest font-bold opacity-50">Creado por</p>
+                              <p className="text-sm text-black">{currentInventory.creatorName}</p>
+                            </div>
+                          </div>
+                        )}
+                        {currentInventory.assignedTo && (
+                          <div className="flex items-center gap-2">
+                            <UserCheck size={18} className="text-blue-600" />
+                            <div>
+                              <p className="text-[10px] uppercase tracking-widest font-bold opacity-50">Asignado a</p>
+                              <p className="text-sm font-bold text-black">{currentInventory.assignedToName || 'Dependiente'}</p>
+                            </div>
+                          </div>
+                        )}
+                      </>
                     )}
-                    {currentInventory.assignedTo && (
-                      <div className="flex items-center gap-2">
-                        <UserCheck size={18} className="text-blue-600" />
-                        <div>
-                          <p className="text-[10px] uppercase tracking-widest font-bold opacity-50">Asignado a</p>
-                          <p className="text-sm font-bold text-black">{currentInventory.assignedToName || 'Dependiente'}</p>
+
+                    {currentUser?.role === 'dependent' && currentInventory.assignedTo === currentUser.id && (
+                      <>
+                        {currentInventory.creatorName && (
+                          <div className="flex items-center gap-2">
+                            <UserIcon size={18} className="text-black/20" />
+                            <div>
+                              <p className="text-[10px] uppercase tracking-widest font-bold opacity-50">Creado por</p>
+                              <p className="text-sm text-black">{currentInventory.creatorName}</p>
+                            </div>
+                          </div>
+                        )}
+                        <div className="flex items-center gap-2">
+                          <UserCheck size={18} className="text-blue-600" />
+                          <div>
+                            <p className="text-[10px] uppercase tracking-widest font-bold opacity-50">Asignación</p>
+                            <p className="text-sm font-bold text-blue-900">Asignado por el administrador</p>
+                          </div>
                         </div>
-                      </div>
+                      </>
                     )}
                   </div>
 

@@ -142,6 +142,18 @@ service cloud.firestore {
              (!('assignmentHistory' in data) || data.assignmentHistory == null || (data.assignmentHistory is list && data.assignmentHistory.size() < 200));
     }
 
+    function hasText(v) { 
+      return v != null && v != ''; 
+    }
+
+    function isAssignableInventory() {
+      return resource.data.get('status','draft') == 'completed' &&
+        hasText(resource.data.get('ownerSignature', null)) &&
+        hasText(resource.data.get('tenantSignature', null)) &&
+        !hasText(resource.data.get('tenantReceiveSignature', null)) &&
+        !hasText(resource.data.get('ownerDeliverySignature', null));
+    }
+
     function assignmentUnchanged() {
       return request.resource.data.get('assignedTo','') == resource.data.get('assignedTo','') &&
         request.resource.data.get('assignedToName','') == resource.data.get('assignedToName','') &&
@@ -152,6 +164,7 @@ service cloud.firestore {
 
     function canManageAssignment() {
       return isSuperAdmin() || (isAdmin() &&
+        isAssignableInventory() &&
         resource.data.get('adminEmail','') == request.auth.token.get('email','') &&
         (request.resource.data.get('assignedTo', null) == null ||
          (exists(/databases/$(database)/documents/users/$(request.resource.data.assignedTo)) &&
