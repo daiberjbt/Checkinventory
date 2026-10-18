@@ -139,7 +139,9 @@ service cloud.firestore {
              (!('assignedToName' in data) || data.assignedToName == null || (data.assignedToName is string && data.assignedToName.size() < 200)) &&
              (!('assignedAt' in data) || data.assignedAt == null || (data.assignedAt is number || data.assignedAt is int)) &&
              (!('assignedBy' in data) || data.assignedBy == null || (data.assignedBy is string && data.assignedBy.size() < 128)) &&
-             (!('assignmentHistory' in data) || data.assignmentHistory == null || (data.assignmentHistory is list && data.assignmentHistory.size() < 200));
+             (!('assignmentHistory' in data) || data.assignmentHistory == null || (data.assignmentHistory is list && data.assignmentHistory.size() < 200)) &&
+             (!('photoMeta' in data) || data.photoMeta == null || data.photoMeta is map) &&
+             (!('completedAt' in data) || data.completedAt == null || (data.completedAt is number || data.completedAt is int));
     }
 
     function hasText(v) { 

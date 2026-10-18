@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { 
   Plus, 
   Home, 
@@ -63,7 +63,8 @@ import {
   Globe,
   Smartphone,
   Link2,
-  UserCheck
+  UserCheck,
+  Clock
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { v4 as uuidv4 } from 'uuid';
@@ -341,8 +342,32 @@ export const resolveAdminEmail = (user: User | null): string | null => {
   return null;
 };
 
+const GRACE_MS = 48 * 60 * 60 * 1000;
+
+export const isVisibleToDependent = (inv: Inventory, depId: string, now: number): boolean => {
+  const bothActas = !!(inv.tenantReceiveSignature && inv.ownerDeliverySignature);
+  if (inv.assignedTo === depId) return !bothActas;
+  if (inv.createdBy === depId) {
+    if (inv.assignedTo) return false;
+    if (inv.status === 'draft') return true;
+    if (inv.status === 'completed' && inv.completedAt && now - inv.completedAt < GRACE_MS) return true;
+  }
+  return false;
+};
+
 export default function App() {
   const [inventories, setInventories] = useState<Inventory[]>([]);
+  const [rawDependentInventories, setRawDependentInventories] = useState<Inventory[]>([]);
+  const [currentTime, setCurrentTime] = useState<number>(() => Date.now());
+
+  // Actualizar currentTime cada 60s para que la ventana de 48h expire sin recargar la página
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setCurrentTime(Date.now());
+    }, 60000);
+    return () => clearInterval(timer);
+  }, []);
+
   const [dependents, setDependents] = useState<User[]>([]);
   const [view, setView] = useState<ViewType>('list');
   const [currentInventory, setCurrentInventory] = useState<Inventory | null>(null);
@@ -382,7 +407,7 @@ export default function App() {
   const [expandedSpaces, setExpandedSpaces] = useState<Record<string, boolean>>({});
   const [targetSpaceId, setTargetSpaceId] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
-  const [statusFilter, setStatusFilter] = useState<'all' | 'draft' | 'completed' | 'received' | 'archived'>('all');
+  const [statusFilter, setStatusFilter] = useState<'all' | 'draft' | 'completed' | 'unassigned' | 'received' | 'archived'>('all');
   const [isListening, setIsListening] = useState<string | null>(null);
   const [showConfirm, setShowConfirm] = useState<{
     show: boolean;
@@ -1551,6 +1576,7 @@ export default function App() {
         })) as Inventory[];
         PhotoSyncEngine.getInstance().setPersistedInventories(data.map(d => d.id));
         setInventories(data);
+        setRawDependentInventories([]);
       }, (error) => {
         handleFirestoreError(error, OperationType.LIST, 'inventories');
       });
@@ -1559,48 +1585,23 @@ export default function App() {
     } else {
       let createdList: Inventory[] = [];
       let assignedList: Inventory[] = [];
-      const prevVisibleIds = new Set<string>();
 
       const updateMergedList = () => {
-        // PhotoSyncEngine.getInstance().setPersistedInventories debe seguir recibiendo TODOS los ids, incluidos los excluidos, para no frenar la subida de fotos pendientes
+        // PhotoSyncEngine.getInstance().setPersistedInventories debe recibir TODOS los ids, incluidos los ocultos
         const allIds = Array.from(new Set([...createdList.map(d => d.id), ...assignedList.map(d => d.id)]));
         PhotoSyncEngine.getInstance().setPersistedInventories(allIds);
 
-        // Al unir los resultados excluye los inventarios de la consulta createdBy que tengan assignedTo con valor distinto de currentUser.id
+        // Unir sin duplicados
         const map = new Map<string, Inventory>();
         for (const inv of createdList) {
-          if (!inv.assignedTo || inv.assignedTo === currentUser.id) {
-            map.set(inv.id, inv);
-          }
+          map.set(inv.id, inv);
         }
-        // Los de la consulta assignedTo == currentUser.id siempre se muestran
         for (const inv of assignedList) {
           map.set(inv.id, inv);
         }
 
-        const visible = Array.from(map.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-        setInventories(visible);
-
-        // Si un dependiente tiene abierto un inventario que acaba de dejar de ser visible para él, ciérralo, vuelve a la lista y muestra showNotify('Este inventario fue asignado a otro dependiente', 'info')
-        if (currentInventoryRef.current) {
-          const openId = currentInventoryRef.current.id;
-          const wasOpenAndBecameInvisible = (
-            createdList.some(inv => inv.id === openId && inv.assignedTo && inv.assignedTo !== currentUser.id) ||
-            (prevVisibleIds.has(openId) && !map.has(openId))
-          );
-
-          if (wasOpenAndBecameInvisible) {
-            setCurrentInventory(null);
-            setView('list');
-            setSignatures({ owner: '', tenant: '' });
-            showNotify('Este inventario fue asignado a otro dependiente', 'info');
-          }
-        }
-
-        prevVisibleIds.clear();
-        for (const inv of visible) {
-          prevVisibleIds.add(inv.id);
-        }
+        const combined = Array.from(map.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+        setRawDependentInventories(combined);
       };
 
       const qCreated = query(
@@ -1642,6 +1643,17 @@ export default function App() {
       };
     }
   }, [currentUser?.id, currentUser?.email, currentUser?.role, isAuthReady]);
+
+  // Calcula el estado visible inventories para el rol dependent aplicando isVisibleToDependent
+  // La ventana de 48h expira cada 60s al cambiar currentTime sin recrear los listeners de Firestore
+  useEffect(() => {
+    if (currentUser?.role === 'dependent') {
+      const visible = rawDependentInventories.filter(inv => 
+        isVisibleToDependent(inv, currentUser.id, currentTime)
+      );
+      setInventories(visible);
+    }
+  }, [rawDependentInventories, currentTime, currentUser?.id, currentUser?.role]);
 
   const getPhotoDataForZip = async (photo: Photo): Promise<{ type: 'blob', blob: Blob } | { type: 'base64', data: string } | null> => {
     if (photo.localBlobId) {
@@ -2128,6 +2140,11 @@ export default function App() {
       console.warn('handleSaveInventory called with null currentInventory');
       return;
     }
+
+    if (isConsultationMode) {
+      showNotify('Este inventario está en modo solo consulta y no se puede modificar', 'warning');
+      return;
+    }
     
     if (!currentInventory.propertyName.trim()) {
       showNotify('Por favor ingrese el nombre del inmueble', 'error');
@@ -2203,6 +2220,7 @@ export default function App() {
       const inventoryToSave: Inventory = { 
         ...currentInventory, 
         status: 'completed',
+        completedAt: currentInventory.completedAt || Date.now(),
         ownerSignature: signatures.owner,
         tenantSignature: signatures.tenant
       };
@@ -2261,6 +2279,11 @@ export default function App() {
     }
     const inventory = inventories.find(i => i.id === id);
     if (!inventory) return;
+
+    if (currentUser?.role === 'dependent' && inventory.createdBy === currentUser.id && inventory.status === 'completed' && inventory.assignedTo !== currentUser.id) {
+      showNotify('No se puede eliminar un inventario en modo consulta', 'error');
+      return;
+    }
 
     // If admin, show simple confirmation
     if (currentUser?.role === 'admin') {
@@ -2364,6 +2387,20 @@ export default function App() {
     );
   };
 
+  const isConsultationMode = Boolean(
+    currentUser?.role === 'dependent' &&
+    currentInventory?.createdBy === currentUser?.id &&
+    currentInventory?.status === 'completed' &&
+    currentInventory?.assignedTo !== currentUser?.id
+  );
+
+  useEffect(() => {
+    if (view === 'reception' && isConsultationMode) {
+      setView('detail');
+      showNotify('Este inventario está en modo solo consulta', 'info');
+    }
+  }, [view, isConsultationMode]);
+
   const handleConfirmAssignment = async () => {
     if (!assigningInventory || !selectedDependentForAssign || !currentUser) return;
 
@@ -2459,6 +2496,11 @@ export default function App() {
   const handleArchiveInventory = async (id: string) => {
     const inventoryToArchive = inventories.find(i => i.id === id);
     if (!inventoryToArchive) return;
+
+    if (currentUser?.role === 'dependent' && inventoryToArchive.createdBy === currentUser.id && inventoryToArchive.status === 'completed' && inventoryToArchive.assignedTo !== currentUser.id) {
+      showNotify('No tiene permisos para archivar este inventario en modo consulta', 'error');
+      return;
+    }
 
     const internalCode = inventoryToArchive.internalCode;
     const existingArchivedList = internalCode 
@@ -2837,6 +2879,11 @@ export default function App() {
   const handleAddAnnex = async () => {
     if (!currentInventory || !currentUser || !annexText.trim()) return;
     
+    if (isConsultationMode) {
+      showNotify('Este inventario está en modo solo consulta', 'warning');
+      return;
+    }
+
     setIsSavingAnnex(true);
     try {
       const newAnnex: Annex = {
@@ -2928,6 +2975,11 @@ export default function App() {
 
   const handleSaveReception = async () => {
     if (!currentInventory || !receptionType || !receptionSignature) return;
+
+    if (isConsultationMode) {
+      showNotify('Este inventario está en modo solo consulta', 'error');
+      return;
+    }
 
     if (receptionType === 'tenant' && currentInventory.tenantReceiveSignature) {
       showNotify('El acta de recibido ya fue firmada previamente y no puede ser modificada.', 'error');
@@ -3599,6 +3651,12 @@ export default function App() {
     }
   };
 
+  useEffect(() => {
+    if (currentUser?.role === 'dependent' && statusFilter !== 'all') {
+      setStatusFilter('all');
+    }
+  }, [currentUser?.role, statusFilter]);
+
   const filteredInventories = React.useMemo(() => {
     return inventories
       .filter(inv => {
@@ -3609,8 +3667,10 @@ export default function App() {
                              (inv.tenantName && inv.tenantName.toLowerCase().includes(searchTerm.toLowerCase()));
         
         let matchesStatus = true;
-        if (statusFilter === 'all') {
+        if (currentUser?.role === 'dependent' || statusFilter === 'all') {
           matchesStatus = true;
+        } else if (statusFilter === 'unassigned') {
+          matchesStatus = isAssignable(inv) && !inv.assignedTo;
         } else if (statusFilter === 'received') {
           matchesStatus = !!(inv.tenantReceiveSignature || inv.ownerDeliverySignature);
         } else {
@@ -3618,8 +3678,25 @@ export default function App() {
         }
         return matchesSearch && matchesStatus;
       })
-      .sort((a, b) => b.createdAt - a.createdAt);
-  }, [inventories, searchTerm, statusFilter]);
+      .sort((a, b) => {
+        if (currentUser?.role === 'dependent') {
+          // 1) Asignados a él pendientes de recibir
+          // 2) Sus borradores
+          // 3) Solo consulta
+          // Dentro de cada grupo por updatedAt descendente
+          const getGroup = (inv: Inventory) => {
+            if (inv.assignedTo === currentUser.id) return 1;
+            if (inv.createdBy === currentUser.id && inv.status === 'draft') return 2;
+            return 3;
+          };
+          const gA = getGroup(a);
+          const gB = getGroup(b);
+          if (gA !== gB) return gA - gB;
+          return (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0);
+        }
+        return b.createdAt - a.createdAt;
+      });
+  }, [inventories, searchTerm, statusFilter, currentUser]);
 
   const handleLogout = async () => {
     confirmAction(
@@ -4770,37 +4847,46 @@ export default function App() {
                   <p className="text-muted text-sm font-medium">Gestiona y revisa el estado de tus propiedades en renta.</p>
                 </div>
                 <div className="relative w-full md:w-auto">
-                  <div className="flex bg-white p-1 rounded-2xl border border-black/5 mb-3 overflow-x-auto no-scrollbar shadow-sm gap-1">
-                    {([
-                      { key: 'all', label: 'Todos', count: inventories.length },
-                      { key: 'draft', label: 'Borradores', count: inventories.filter(i => i.status === 'draft').length },
-                      { key: 'completed', label: 'Listos', count: inventories.filter(i => i.status === 'completed').length },
-                      { key: 'received', label: 'Recibidos', count: inventories.filter(i => !!(i.tenantReceiveSignature || i.ownerDeliverySignature)).length },
-                      { key: 'archived', label: 'Archivados', count: inventories.filter(i => i.status === 'archived').length }
-                    ] as const).map((tab) => {
-                      const isActive = statusFilter === tab.key;
-                      return (
-                        <button
-                          key={tab.key}
-                          onClick={() => setStatusFilter(tab.key as any)}
-                          className={`px-3.5 py-2 text-[10px] font-bold uppercase tracking-wider rounded-xl transition-all flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer shrink-0 ${
-                            isActive 
-                              ? 'bg-black text-white shadow-sm' 
-                              : 'text-muted hover:bg-black/5 hover:text-black'
-                          }`}
-                        >
-                          <span>{tab.label}</span>
-                          <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-bold ${
-                            isActive 
-                              ? 'bg-white/20 text-white' 
-                              : 'bg-black/5 text-muted'
-                          }`}>
-                            {tab.count}
-                          </span>
-                        </button>
-                      );
-                    })}
-                  </div>
+                  {currentUser?.role === 'admin' && (
+                    <div className="flex bg-white p-1 rounded-2xl border border-black/5 mb-3 overflow-x-auto no-scrollbar shadow-sm gap-1">
+                      {(() => {
+                        const unassignedCount = inventories.filter(i => isAssignable(i) && !i.assignedTo).length;
+                        const tabs = [
+                          { key: 'all' as const, label: 'Todos', count: inventories.length, highlight: false },
+                          { key: 'draft' as const, label: 'Borradores', count: inventories.filter(i => i.status === 'draft').length, highlight: false },
+                          { key: 'completed' as const, label: 'Listos', count: inventories.filter(i => i.status === 'completed').length, highlight: false },
+                          { key: 'unassigned' as const, label: 'Firmados sin asignar', count: unassignedCount, highlight: unassignedCount > 0 },
+                          { key: 'received' as const, label: 'Recibidos', count: inventories.filter(i => !!(i.tenantReceiveSignature || i.ownerDeliverySignature)).length, highlight: false },
+                          { key: 'archived' as const, label: 'Archivados', count: inventories.filter(i => i.status === 'archived').length, highlight: false }
+                        ];
+                        return tabs.map((tab) => {
+                          const isActive = statusFilter === tab.key;
+                          return (
+                            <button
+                              key={tab.key}
+                              onClick={() => setStatusFilter(tab.key)}
+                              className={`px-3.5 py-2 text-[10px] font-bold uppercase tracking-wider rounded-xl transition-all flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer shrink-0 ${
+                                isActive 
+                                  ? 'bg-black text-white shadow-sm' 
+                                  : 'text-muted hover:bg-black/5 hover:text-black'
+                              }`}
+                            >
+                              <span>{tab.label}</span>
+                              <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-bold ${
+                                isActive 
+                                  ? 'bg-white/20 text-white' 
+                                  : tab.highlight
+                                  ? 'bg-amber-100 text-amber-800 border border-amber-300'
+                                  : 'bg-black/5 text-muted'
+                              }`}>
+                                {tab.count}
+                              </span>
+                            </button>
+                          );
+                        });
+                      })()}
+                    </div>
+                  )}
                   <div className="relative">
                     <input 
                       type="text"
@@ -4821,8 +4907,14 @@ export default function App() {
                   <div className="w-20 h-20 bg-[#f8f9fa] rounded-3xl flex items-center justify-center mx-auto mb-6">
                     <ClipboardList size={40} className="text-black opacity-20" />
                   </div>
-                  <h3 className="text-2xl font-bold mb-3">Tu lista está vacía</h3>
-                  <p className="text-muted max-w-md mx-auto mb-8">Comienza a documentar el estado de tus inmuebles para tener un registro fotográfico y escrito profesional.</p>
+                  <h3 className="text-2xl font-bold mb-3">
+                    {currentUser?.role === 'dependent' ? 'No tienes inventarios en curso.' : 'Tu lista está vacía'}
+                  </h3>
+                  <p className="text-muted max-w-md mx-auto mb-8">
+                    {currentUser?.role === 'dependent'
+                      ? 'Crea un nuevo inventario para comenzar a registrar una propiedad.'
+                      : 'Comienza a documentar el estado de tus inmuebles para tener un registro fotográfico y escrito profesional.'}
+                  </p>
                   <button 
                     onClick={startNewInventory}
                     className="bg-black text-white px-8 py-4 rounded-2xl font-bold hover:bg-black/80 transition-all shadow-xl shadow-black/10"
@@ -4833,45 +4925,59 @@ export default function App() {
               ) : filteredInventories.length === 0 ? (
                 <div className="bg-white rounded-[2rem] p-16 text-center border border-black/5 shadow-sm space-y-4">
                   <div className="w-20 h-20 bg-[#f8f9fa] rounded-3xl flex items-center justify-center mx-auto text-black/30">
-                    {statusFilter === 'received' ? <Key size={40} className="text-emerald-600" /> : <ClipboardList size={40} />}
+                    {statusFilter === 'received' ? <Key size={40} className="text-emerald-600" /> : statusFilter === 'unassigned' ? <UserCheck size={40} className="text-amber-600" /> : <ClipboardList size={40} />}
                   </div>
                   <div>
                     <h3 className="text-2xl font-bold">
-                      {statusFilter === 'received' 
-                        ? 'No hay inventarios recibidos' 
-                        : statusFilter === 'draft' 
-                          ? 'No hay borradores' 
-                          : statusFilter === 'completed' 
-                            ? 'No hay inventarios listos' 
-                            : statusFilter === 'archived'
-                              ? 'No hay inventarios archivados'
-                              : 'No se encontraron inventarios'}
+                      {currentUser?.role === 'dependent' && !searchTerm
+                        ? 'No tienes inventarios en curso.'
+                        : statusFilter === 'received' 
+                          ? 'No hay inventarios recibidos' 
+                          : statusFilter === 'unassigned'
+                            ? 'No hay inventarios firmados sin asignar'
+                            : statusFilter === 'draft' 
+                              ? 'No hay borradores' 
+                              : statusFilter === 'completed' 
+                                ? 'No hay inventarios listos' 
+                                : statusFilter === 'archived'
+                                  ? 'No hay inventarios archivados'
+                                  : 'No se encontraron inventarios'}
                     </h3>
                     <p className="text-muted text-sm max-w-md mx-auto mt-2 leading-relaxed">
-                      {statusFilter === 'received' 
-                        ? 'Los inventarios aparecerán en este apartado cuando se hayan firmado las actas de recibido (inquilino) o entrega (propietario) al finalizar el contrato.' 
-                        : searchTerm 
-                          ? `No hay resultados para la búsqueda "${searchTerm}".`
-                          : 'No hay propiedades que coincidan con este filtro actualmente.'}
+                      {searchTerm 
+                        ? `No hay resultados para la búsqueda "${searchTerm}".`
+                        : currentUser?.role === 'dependent'
+                          ? 'Crea un nuevo inventario para comenzar a registrar una propiedad.'
+                          : statusFilter === 'received' 
+                            ? 'Los inventarios aparecerán en este apartado cuando se hayan firmado las actas de recibido (inquilino) o entrega (propietario) al finalizar el contrato.' 
+                            : statusFilter === 'unassigned'
+                              ? 'Aquí aparecerán los inventarios completados y firmados por ambas partes que aún no han sido asignados a ningún dependiente.'
+                              : 'No hay propiedades que coincidan con este filtro actualmente.'}
                     </p>
                   </div>
                   <div className="flex flex-wrap items-center justify-center gap-3 pt-4">
-                    {searchTerm && (
+                    {searchTerm ? (
                       <button 
                         onClick={() => setSearchTerm('')}
                         className="bg-black/5 text-black px-6 py-2.5 rounded-xl font-bold text-xs hover:bg-black/10 transition-all"
                       >
                         Limpiar búsqueda
                       </button>
-                    )}
-                    {statusFilter !== 'all' && (
+                    ) : currentUser?.role === 'dependent' ? (
+                      <button 
+                        onClick={startNewInventory}
+                        className="bg-black text-white px-8 py-3.5 rounded-2xl font-bold hover:bg-black/80 transition-all shadow-xl shadow-black/10 text-sm"
+                      >
+                        Crear nuevo
+                      </button>
+                    ) : statusFilter !== 'all' ? (
                       <button 
                         onClick={() => setStatusFilter('all')}
                         className="bg-black text-white px-6 py-2.5 rounded-xl font-bold text-xs hover:bg-black/80 transition-all shadow-sm"
                       >
                         Ver todos los inventarios
                       </button>
-                    )}
+                    ) : null}
                   </div>
                 </div>
               ) : (
@@ -4898,26 +5004,46 @@ export default function App() {
                     >
                       <div className="p-8 flex-1">
                         <div className="flex justify-between items-start mb-6">
-                          <div className="flex flex-wrap gap-2">
+                          <div className="flex flex-wrap gap-2 items-center">
                             <div className="bg-black/5 px-3 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-wider text-black/60">
                               {inv.spaces.reduce((acc, s) => acc + s.photos.length, 0)} Fotos
                             </div>
-                            <div className={`px-3 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${
-                              inv.status === 'completed' ? 'bg-emerald-100 text-emerald-700' : 
-                              inv.status === 'archived' ? 'bg-gray-100 text-gray-700' :
-                              'bg-amber-100 text-amber-700'
-                            }`}>
-                              {inv.status === 'completed' ? 'Listo' : inv.status === 'archived' ? 'Archivado' : 'Borrador'}
-                            </div>
-                            {(inv.tenantReceiveSignature || inv.ownerDeliverySignature) && (
-                              <div className={`px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider flex items-center gap-1 shadow-sm ${
-                                inv.tenantReceiveSignature && inv.ownerDeliverySignature 
-                                  ? 'bg-emerald-600 text-white' 
-                                  : 'bg-emerald-50 text-emerald-700 border border-emerald-200'
-                              }`}>
-                                <Key size={11} />
-                                <span>{inv.tenantReceiveSignature && inv.ownerDeliverySignature ? 'Recibido Completo' : 'Acta Firmada'}</span>
-                              </div>
+                            {currentUser?.role === 'dependent' ? (
+                              inv.assignedTo === currentUser.id ? (
+                                <div className="bg-blue-100 text-blue-800 border border-blue-200 px-3 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-wider flex items-center gap-1.5 shadow-sm">
+                                  <UserCheck size={12} className="text-blue-600 shrink-0" />
+                                  <span>Asignado a ti · pendiente de recibir</span>
+                                </div>
+                              ) : inv.status === 'draft' ? (
+                                <div className="bg-gray-100 text-gray-700 border border-gray-200 px-3 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-wider flex items-center gap-1.5 shadow-sm">
+                                  <span>Borrador</span>
+                                </div>
+                              ) : (
+                                <div className="bg-amber-100 text-amber-900 border border-amber-200 px-3 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-wider flex items-center gap-1.5 shadow-sm">
+                                  <Clock size={12} className="text-amber-600 shrink-0" />
+                                  <span>Solo consulta hasta {inv.completedAt ? format(new Date(inv.completedAt + GRACE_MS), 'dd/MM/yyyy HH:mm') : '48h'}</span>
+                                </div>
+                              )
+                            ) : (
+                              <>
+                                <div className={`px-3 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${
+                                  inv.status === 'completed' ? 'bg-emerald-100 text-emerald-700' : 
+                                  inv.status === 'archived' ? 'bg-gray-100 text-gray-700' :
+                                  'bg-amber-100 text-amber-700'
+                                }`}>
+                                  {inv.status === 'completed' ? 'Listo' : inv.status === 'archived' ? 'Archivado' : 'Borrador'}
+                                </div>
+                                {(inv.tenantReceiveSignature || inv.ownerDeliverySignature) && (
+                                  <div className={`px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider flex items-center gap-1 shadow-sm ${
+                                    inv.tenantReceiveSignature && inv.ownerDeliverySignature 
+                                      ? 'bg-emerald-600 text-white' 
+                                      : 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                                  }`}>
+                                    <Key size={11} />
+                                    <span>{inv.tenantReceiveSignature && inv.ownerDeliverySignature ? 'Recibido Completo' : 'Acta Firmada'}</span>
+                                  </div>
+                                )}
+                              </>
                             )}
                           </div>
                           <span className="text-[11px] font-bold text-muted uppercase tracking-wider opacity-60">{inv.date}</span>
@@ -5007,6 +5133,13 @@ export default function App() {
                             </div>
                           </div>
                         )}
+
+                        {currentUser?.role === 'dependent' && inv.createdBy === currentUser.id && inv.status === 'completed' && inv.assignedTo !== currentUser.id && inv.completedAt && (
+                          <div className="mb-4 p-2.5 bg-amber-50/80 border border-amber-200 rounded-xl flex items-center gap-2 text-amber-900 text-xs font-medium">
+                            <Clock size={14} className="text-amber-600 shrink-0" />
+                            <span>Solo consulta hasta {format(new Date(inv.completedAt + GRACE_MS), 'dd/MM/yyyy HH:mm')}</span>
+                          </div>
+                        )}
                         
                         <div className="flex items-center gap-3 pt-6 border-t border-black/5">
                           <button 
@@ -5046,32 +5179,47 @@ export default function App() {
                                 <div className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse" />
                                 Firmado
                               </div>
-                              {(inv.tenantReceiveSignature || inv.ownerDeliverySignature) && (
-                                <button
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    setCurrentInventory(inv);
-                                    setReceptionType(null);
-                                    navigateTo('reception');
-                                  }}
-                                  className="text-[10px] font-bold uppercase tracking-widest text-emerald-700 hover:text-emerald-800 transition-colors flex items-center gap-1.5 py-1.5 px-3 bg-emerald-50 hover:bg-emerald-100 rounded-lg border border-emerald-200"
-                                  title="Ver Actas de Recepción"
-                                >
-                                  <Key size={12} />
-                                  Actas
-                                </button>
-                              )}
-                              <button 
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  handleArchiveInventory(inv.id);
-                                }}
-                                className="text-[10px] font-bold uppercase tracking-widest text-muted hover:text-black transition-colors flex items-center gap-2 py-1.5 px-3 bg-black/5 rounded-lg hover:bg-black/10"
-                                title="Archivar para nuevo contrato"
-                              >
-                                <Archive size={14} />
-                                Archivar
-                              </button>
+                              {(() => {
+                                const isCardConsultation = (
+                                  currentUser?.role === 'dependent' &&
+                                  inv.createdBy === currentUser.id &&
+                                  inv.status === 'completed' &&
+                                  inv.assignedTo !== currentUser.id
+                                );
+                                if (isCardConsultation) return null;
+                                return (
+                                  <>
+                                    {(inv.tenantReceiveSignature || inv.ownerDeliverySignature) && (
+                                      <button
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setCurrentInventory(inv);
+                                          setReceptionType(null);
+                                          navigateTo('reception');
+                                        }}
+                                        className="text-[10px] font-bold uppercase tracking-widest text-emerald-700 hover:text-emerald-800 transition-colors flex items-center gap-1.5 py-1.5 px-3 bg-emerald-50 hover:bg-emerald-100 rounded-lg border border-emerald-200"
+                                        title="Ver Actas de Recepción"
+                                      >
+                                        <Key size={12} />
+                                        Actas
+                                      </button>
+                                    )}
+                                    {currentUser?.role === 'admin' && (
+                                      <button 
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          handleArchiveInventory(inv.id);
+                                        }}
+                                        className="text-[10px] font-bold uppercase tracking-widest text-muted hover:text-black transition-colors flex items-center gap-2 py-1.5 px-3 bg-black/5 rounded-lg hover:bg-black/10"
+                                        title="Archivar para nuevo contrato"
+                                      >
+                                        <Archive size={14} />
+                                        Archivar
+                                      </button>
+                                    )}
+                                  </>
+                                );
+                              })()}
                             </>
                           ) : inv.status === 'archived' ? (
                             <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-gray-400 bg-gray-50 py-1.5 px-3 rounded-lg">
@@ -6331,16 +6479,32 @@ export default function App() {
                     Exportar PDF
                   </button>
                 )}
-                <button 
-                  onClick={() => handleDeleteInventory(currentInventory.id)}
-                  className="w-10 h-10 flex items-center justify-center bg-red-50 text-red-600 rounded-xl hover:bg-red-600 hover:text-white transition-all"
-                  title="Eliminar Inventario"
-                >
-                  <Trash2 size={18} />
-                </button>
+                {!isConsultationMode && (
+                  <button 
+                    onClick={() => handleDeleteInventory(currentInventory.id)}
+                    className="w-10 h-10 flex items-center justify-center bg-red-50 text-red-600 rounded-xl hover:bg-red-600 hover:text-white transition-all"
+                    title="Eliminar Inventario"
+                  >
+                    <Trash2 size={18} />
+                  </button>
+                )}
               </div>
 
               <div className="bg-white rounded-[2.5rem] p-10 border border-black/5 shadow-sm space-y-10">
+                {isConsultationMode && currentInventory.completedAt && (
+                  <div className="p-5 bg-amber-50/90 border border-amber-200 rounded-2xl flex items-center gap-3.5 text-amber-900 shadow-sm">
+                    <Clock size={22} className="text-amber-600 shrink-0" />
+                    <div>
+                      <p className="text-xs font-bold uppercase tracking-wider text-amber-700">Modo Solo Consulta</p>
+                      <p className="text-sm font-semibold">
+                        Solo consulta hasta {format(new Date(currentInventory.completedAt + GRACE_MS), 'dd/MM/yyyy HH:mm')}
+                      </p>
+                      <p className="text-xs text-amber-800/80 mt-0.5">
+                        Puedes revisar los datos, descargar fotos y exportar el PDF. Las actas de recepción son gestionadas por el dependiente asignado o el administrador.
+                      </p>
+                    </div>
+                  </div>
+                )}
                 <div className="border-b border-black/5 pb-8">
                   <h2 className="text-4xl font-bold tracking-tight mb-4">{currentInventory.propertyName}</h2>
                   <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-6 text-muted font-medium">
@@ -6767,13 +6931,15 @@ export default function App() {
                             <h3 className="text-xl font-bold">Anexos y Modificaciones</h3>
                             <p className="text-muted text-xs font-medium mt-1">Registros adicionales realizados después de la firma.</p>
                           </div>
-                          <button 
-                            onClick={() => setShowAnnexModal(true)}
-                            className="flex items-center gap-2 px-4 py-2 bg-black text-white rounded-xl hover:bg-black/80 transition-all text-xs font-bold shadow-lg shadow-black/10"
-                          >
-                            <Plus size={14} />
-                            <span>Añadir Anexo</span>
-                          </button>
+                          {!isConsultationMode && (
+                            <button 
+                              onClick={() => setShowAnnexModal(true)}
+                              className="flex items-center gap-2 px-4 py-2 bg-black text-white rounded-xl hover:bg-black/80 transition-all text-xs font-bold shadow-lg shadow-black/10"
+                            >
+                              <Plus size={14} />
+                              <span>Añadir Anexo</span>
+                            </button>
+                          )}
                         </div>
 
                         {currentInventory.annexes && currentInventory.annexes.length > 0 ? (
@@ -6836,7 +7002,7 @@ export default function App() {
                   </div>
                 )}
 
-                {currentInventory.status === 'completed' && currentInventory.ownerSignature && currentInventory.tenantSignature && (
+                {currentInventory.status === 'completed' && currentInventory.ownerSignature && currentInventory.tenantSignature && !isConsultationMode && (
                   <div className="pt-16 border-t border-black/5 flex justify-center">
                     <button 
                       onClick={() => {

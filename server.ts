@@ -596,6 +596,7 @@ async function startServer() {
         if (signerName) updatePayload.ownerName = signerName.trim();
         if (data.tenantSignature || data.remoteSigningTokens?.tenant?.signed) {
           updatePayload.status = 'completed';
+          updatePayload.completedAt = Date.now();
         }
       } else if (role === 'tenant') {
         updatePayload.tenantSignature = signature;
@@ -604,6 +605,7 @@ async function startServer() {
         if (signerName) updatePayload.tenantName = signerName.trim();
         if (data.ownerSignature || data.remoteSigningTokens?.owner?.signed) {
           updatePayload.status = 'completed';
+          updatePayload.completedAt = Date.now();
         }
       }
 

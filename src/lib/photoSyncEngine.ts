@@ -1,4 +1,4 @@
-import { doc, getDoc, setDoc, runTransaction } from 'firebase/firestore';
+import { doc, getDoc, setDoc, runTransaction, FieldPath } from 'firebase/firestore';
 import { ref, uploadBytes, getDownloadURL, deleteObject } from 'firebase/storage';
 import { db, auth, storage } from '../firebase';
 import { OfflinePhotoRecord, Inventory, InventorySpace, Annex, Photo } from '../types';
@@ -17,6 +17,80 @@ type SyncListener = (event: {
   url?: string;
   error?: string;
 }) => void;
+
+/**
+ * Devuelve el inventario con las fotos completadas a partir de photoMeta.
+ * Para cada entrada de photoMeta, si en inv.spaces[].photos existe una foto con ese id
+ * (o localBlobId igual) asígnale url, storagePath, syncStatus 'synced' y dataUrl '';
+ * si no existe, agrégala al espacio spaceId con esos datos.
+ */
+export function applyPhotoMeta(inv: Inventory): Inventory {
+  if (!inv) return inv;
+  if (!inv.photoMeta || Object.keys(inv.photoMeta).length === 0) {
+    return inv;
+  }
+
+  const photoMeta = inv.photoMeta;
+  const spaces = Array.isArray(inv.spaces) ? inv.spaces.map(s => ({
+    ...s,
+    photos: Array.isArray(s.photos) ? [...s.photos] : []
+  })) : [];
+
+  for (const [photoId, meta] of Object.entries(photoMeta)) {
+    if (!meta) continue;
+    let found = false;
+
+    // Buscar si ya existe en algún espacio por id o localBlobId
+    for (let sIdx = 0; sIdx < spaces.length; sIdx++) {
+      const space = spaces[sIdx];
+      const pIdx = space.photos.findIndex(p => p.id === photoId || (p as any).localBlobId === photoId);
+      if (pIdx !== -1) {
+        space.photos[pIdx] = {
+          ...space.photos[pIdx],
+          id: photoId,
+          url: meta.url,
+          storagePath: meta.storagePath,
+          syncStatus: 'synced',
+          dataUrl: '',
+          caption: meta.caption !== undefined ? meta.caption : space.photos[pIdx].caption,
+          timestamp: meta.timestamp || space.photos[pIdx].timestamp || meta.syncedAt
+        };
+        found = true;
+        break;
+      }
+    }
+
+    // Si no existe, agregarla al espacio spaceId con esos datos
+    if (!found) {
+      const newPhoto: Photo = {
+        id: photoId,
+        url: meta.url,
+        storagePath: meta.storagePath,
+        syncStatus: 'synced',
+        dataUrl: '',
+        caption: meta.caption || '',
+        timestamp: meta.timestamp || meta.syncedAt
+      };
+
+      if (meta.spaceId) {
+        const targetSpaceIdx = spaces.findIndex(s => s.id === meta.spaceId);
+        if (targetSpaceIdx !== -1) {
+          spaces[targetSpaceIdx].photos.push(newPhoto);
+          found = true;
+        }
+      }
+
+      if (!found && spaces.length > 0) {
+        spaces[0].photos.push(newPhoto);
+      }
+    }
+  }
+
+  return {
+    ...inv,
+    spaces
+  };
+}
 
 export class PhotoSyncEngine {
   private static instance: PhotoSyncEngine;
@@ -365,17 +439,45 @@ export class PhotoSyncEngine {
         const storagePath = freshRecord.storagePath;
         const storageRef = ref(storage, storagePath);
 
-        // Subir Blob binario puro
-        const uploadResult = await uploadBytes(storageRef, freshRecord.blob, {
-          contentType: freshRecord.contentType || 'image/jpeg',
-          customMetadata: {
-            photoId: freshRecord.id,
-            inventoryId: freshRecord.inventoryId,
-            adminUid: freshRecord.adminUid
-          }
-        });
+        let uploadSucceeded = false;
+        let lastUploadErr: any = null;
 
-        downloadUrl = await getDownloadURL(uploadResult.ref);
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            if (attempt > 0 && auth.currentUser) {
+              try {
+                await auth.currentUser.getIdToken(true);
+              } catch (tErr) {
+                console.warn('[SyncEngine] Error al refrescar token de autenticación:', tErr);
+              }
+            }
+
+            const uploadResult = await uploadBytes(storageRef, freshRecord.blob, {
+              contentType: freshRecord.contentType || 'image/jpeg',
+              customMetadata: {
+                photoId: freshRecord.id,
+                inventoryId: freshRecord.inventoryId,
+                adminUid: freshRecord.adminUid
+              }
+            });
+
+            downloadUrl = await getDownloadURL(uploadResult.ref);
+            uploadSucceeded = true;
+            break;
+          } catch (sErr: any) {
+            lastUploadErr = sErr;
+            const sCode = String(sErr?.code || '');
+            if (sCode === 'storage/unauthorized' && attempt === 0 && auth.currentUser) {
+              console.warn('[SyncEngine] storage/unauthorized detectado. Refrescando token y reintentando...');
+              continue;
+            }
+            break;
+          }
+        }
+
+        if (!uploadSucceeded) {
+          throw lastUploadErr;
+        }
 
         // CHECKPOINT: Guardar en IndexedDB que Storage ya tiene el archivo
         freshRecord.storageUploaded = true;
@@ -443,53 +545,72 @@ export class PhotoSyncEngine {
             wasPersisted = true;
           }
         } else {
-          const spaces = Array.isArray(invData.spaces) ? [...invData.spaces] : [];
-          const spaceIdx = spaces.findIndex(s => s.id === freshRecord.spaceId);
+          if (invData.status === 'completed' || invData.status === 'archived') {
+            // Si remoteInvData.status es 'completed' o 'archived' y la foto NO es de anexo,
+            // NO modifiques `spaces`: dentro de la transacción usa transaction.update
+            const storagePath = freshRecord.storagePath;
+            const spaceId = freshRecord.spaceId;
+            const timestamp = freshRecord.createdAt;
+            const caption = freshRecord.caption || '';
+            const syncedAt = Date.now();
 
-          if (spaceIdx === -1) {
-            spaceNotExists = true;
-            return;
-          }
-
-          const targetSpace = { ...spaces[spaceIdx] };
-          // Preservar estrictamente todas las fotografías existentes
-          const photos = Array.isArray(targetSpace.photos) ? [...targetSpace.photos] : [];
-          const pIdx = photos.findIndex(p => p.id === freshRecord.id || (p as any).localBlobId === freshRecord.id);
-
-          if (pIdx !== -1) {
-            // Actualizar la foto existente sin duplicar ni alterar las demás
-            const existingPhoto = photos[pIdx];
-            photos[pIdx] = {
-              ...existingPhoto,
-              id: freshRecord.id,
-              url: downloadUrl,
-              dataUrl: '', // NUNCA Base64
-              syncStatus: 'synced',
-              storagePath: freshRecord.storagePath,
-              timestamp: existingPhoto.timestamp || freshRecord.createdAt
-            };
+            transaction.update(
+              inventoryRef,
+              new FieldPath('photoMeta', freshRecord.id),
+              { url: downloadUrl, storagePath, spaceId, timestamp, caption, syncedAt },
+              'updatedAt',
+              Date.now()
+            );
+            wasPersisted = true;
           } else {
-            // Antes de hacer photos.push(), confirmar que no haya sido eliminada en UI
-            const liveRecord = await getPendingPhoto(freshRecord.id);
-            if (!liveRecord || liveRecord.isDeleted) {
-              photoWasDeleted = true;
-              return; // NO insertar en Firestore
+            const spaces = Array.isArray(invData.spaces) ? [...invData.spaces] : [];
+            const spaceIdx = spaces.findIndex(s => s.id === freshRecord.spaceId);
+
+            if (spaceIdx === -1) {
+              spaceNotExists = true;
+              return;
             }
 
-            photos.push({
-              id: freshRecord.id,
-              url: downloadUrl,
-              dataUrl: '',
-              timestamp: freshRecord.createdAt,
-              syncStatus: 'synced',
-              storagePath: freshRecord.storagePath,
-              caption: freshRecord.caption || ''
-            });
+            const targetSpace = { ...spaces[spaceIdx] };
+            // Preservar estrictamente todas las fotografías existentes
+            const photos = Array.isArray(targetSpace.photos) ? [...targetSpace.photos] : [];
+            const pIdx = photos.findIndex(p => p.id === freshRecord.id || (p as any).localBlobId === freshRecord.id);
+
+            if (pIdx !== -1) {
+              // Actualizar la foto existente sin duplicar ni alterar las demás
+              const existingPhoto = photos[pIdx];
+              photos[pIdx] = {
+                ...existingPhoto,
+                id: freshRecord.id,
+                url: downloadUrl,
+                dataUrl: '', // NUNCA Base64
+                syncStatus: 'synced',
+                storagePath: freshRecord.storagePath,
+                timestamp: existingPhoto.timestamp || freshRecord.createdAt
+              };
+            } else {
+              // Antes de hacer photos.push(), confirmar que no haya sido eliminada en UI
+              const liveRecord = await getPendingPhoto(freshRecord.id);
+              if (!liveRecord || liveRecord.isDeleted) {
+                photoWasDeleted = true;
+                return; // NO insertar en Firestore
+              }
+
+              photos.push({
+                id: freshRecord.id,
+                url: downloadUrl,
+                dataUrl: '',
+                timestamp: freshRecord.createdAt,
+                syncStatus: 'synced',
+                storagePath: freshRecord.storagePath,
+                caption: freshRecord.caption || ''
+              });
+            }
+            targetSpace.photos = photos;
+            spaces[spaceIdx] = targetSpace;
+            transaction.update(inventoryRef, { spaces, updatedAt: Date.now() });
+            wasPersisted = true;
           }
-          targetSpace.photos = photos;
-          spaces[spaceIdx] = targetSpace;
-          transaction.update(inventoryRef, { spaces, updatedAt: Date.now() });
-          wasPersisted = true;
         }
       });
 
@@ -508,10 +629,13 @@ export class PhotoSyncEngine {
 
       // Si el inventario o espacio no estaban disponibles durante la transacción:
       if (docNotExists || spaceNotExists || !wasPersisted) {
-        console.log(`[SyncEngine] Documento o espacio para foto ${freshRecord.id} no listo aún en Firestore. Restableciendo status a 'pending' (esperando guardar inventario).`);
+        console.log(`[SyncEngine] Documento o espacio para foto ${freshRecord.id} no listo aún en Firestore. Restableciendo status a 'pending'.`);
         freshRecord.status = 'pending';
         freshRecord.downloadUrl = downloadUrl;
         freshRecord.lastAttemptAt = Date.now();
+        freshRecord.lastError = docNotExists
+          ? 'Inventario aún no guardado en la nube'
+          : (spaceNotExists ? 'Espacio no encontrado en el inventario' : 'Inventario pendiente de persistencia');
         await updatePhotoRecord(freshRecord);
         return; // Retorno limpio sin incrementar retryCount
       }
@@ -528,13 +652,43 @@ export class PhotoSyncEngine {
         url: downloadUrl
       });
     } catch (err: any) {
+      const errCode = String(err?.code || '');
       const errMsg = String(err?.message || err);
-      // Si recibimos permission-denied al acceder a un inventario no persistido o en transición:
-      if (err?.code === 'permission-denied' || errMsg.toLowerCase().includes('permission') || errMsg.toLowerCase().includes('permissions')) {
+
+      // Distinguir errores de Storage (código que empieza con 'storage/')
+      if (errCode.startsWith('storage/')) {
+        let readableError = err?.message || 'Error al subir a Storage';
+        if (errCode === 'storage/unauthorized') {
+          readableError = 'Sin permiso para subir a Storage';
+        } else if (errCode === 'storage/quota-exceeded') {
+          readableError = 'Cuota de almacenamiento de Firebase Storage excedida';
+        } else if (errCode === 'storage/retry-limit-exceeded') {
+          readableError = 'Límite de reintentos de conexión a Storage excedido';
+        }
+
+        console.error(`[SyncEngine] Error de Storage en foto ${freshRecord.id} (${errCode}):`, readableError);
+        freshRecord.status = 'failed';
+        freshRecord.retryCount = (freshRecord.retryCount || 0) + 1;
+        freshRecord.lastError = readableError;
+        freshRecord.lastAttemptAt = Date.now();
+        await updatePhotoRecord(freshRecord);
+
+        this.notify({
+          type: 'photo_failed',
+          photoId: freshRecord.id,
+          inventoryId: freshRecord.inventoryId,
+          error: freshRecord.lastError
+        });
+        return;
+      }
+
+      // Si recibimos permission-denied de Firestore (al acceder a un inventario no persistido o en transición):
+      if (errCode === 'permission-denied' || errMsg.toLowerCase().includes('permission-denied')) {
         console.warn(`[SyncEngine] Documento ${freshRecord.inventoryId} no accesible aún en Firestore (posible borrador sin persistir). Manteniendo foto ${freshRecord.id} en IndexedDB en status 'pending'.`);
         freshRecord.status = 'pending';
         freshRecord.downloadUrl = downloadUrl;
         freshRecord.lastAttemptAt = Date.now();
+        freshRecord.lastError = 'Permiso denegado en Firestore (borrador sin persistir o sin autorización)';
         await updatePhotoRecord(freshRecord);
         return;
       }
@@ -543,7 +697,7 @@ export class PhotoSyncEngine {
       console.error(`[SyncEngine] Error al sincronizar foto ${freshRecord.id}:`, err);
       freshRecord.status = 'failed';
       freshRecord.retryCount = (freshRecord.retryCount || 0) + 1;
-      freshRecord.lastError = err?.message || String(err);
+      freshRecord.lastError = err?.message || String(err) || 'Error desconocido al sincronizar';
       freshRecord.lastAttemptAt = Date.now();
       await updatePhotoRecord(freshRecord);
 

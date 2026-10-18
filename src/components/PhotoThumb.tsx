@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { Photo } from '../types';
-import { getPhotoBlob } from '../lib/offlinePhotoDb';
-import { Image as ImageIcon, Loader2, CloudUpload } from 'lucide-react';
+import { Photo, OfflinePhotoRecord } from '../types';
+import { getPhotoBlob, getPendingPhoto } from '../lib/offlinePhotoDb';
+import { photoSyncEngine } from '../lib/photoSyncEngine';
+import { Image as ImageIcon, Loader2, CloudUpload, AlertCircle } from 'lucide-react';
 
 export async function getPhotoDisplayUrl(photo: Photo): Promise<string> {
   if (photo.url) return photo.url;
@@ -37,6 +38,41 @@ export const PhotoThumb: React.FC<PhotoThumbProps> = ({
   });
   const [loading, setLoading] = useState<boolean>(!src);
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
+  const [offlineRecord, setOfflineRecord] = useState<OfflinePhotoRecord | null>(null);
+
+  useEffect(() => {
+    let isMounted = true;
+    const targetId = photo.localBlobId || photo.id;
+    if (!targetId || photo.url) {
+      setOfflineRecord(null);
+      return;
+    }
+
+    const loadRecord = async () => {
+      try {
+        const rec = await getPendingPhoto(targetId);
+        if (isMounted) setOfflineRecord(rec);
+      } catch (e) {
+        // Ignorar
+      }
+    };
+
+    loadRecord();
+
+    const unsub = photoSyncEngine.subscribe((event) => {
+      if (event.photoId === targetId || event.type === 'sync_finished') {
+        loadRecord();
+      }
+    });
+
+    const interval = setInterval(loadRecord, 30000);
+
+    return () => {
+      isMounted = false;
+      unsub();
+      clearInterval(interval);
+    };
+  }, [photo.localBlobId, photo.id, photo.url]);
 
   useEffect(() => {
     let isMounted = true;
@@ -81,6 +117,18 @@ export const PhotoThumb: React.FC<PhotoThumbProps> = ({
     };
   }, [photo.url, photo.dataUrl, photo.localBlobId]);
 
+  const isFailed = offlineRecord?.status === 'failed';
+  const isStalePending = Boolean(
+    offlineRecord &&
+    offlineRecord.status === 'pending' &&
+    typeof navigator !== 'undefined' &&
+    navigator.onLine &&
+    (Date.now() - offlineRecord.createdAt > 10 * 60 * 1000)
+  );
+
+  const hasSyncError = isFailed || isStalePending;
+  const syncErrorTooltip = offlineRecord?.lastError || (isStalePending ? 'Más de 10 minutos pendiente de sincronización con conexión activa' : 'Error al sincronizar foto');
+
   return (
     <div 
       className={`relative w-full h-full overflow-hidden bg-neutral-100 dark:bg-neutral-800 flex items-center justify-center ${className}`}
@@ -104,13 +152,23 @@ export const PhotoThumb: React.FC<PhotoThumbProps> = ({
       )}
 
       {showSyncBadge && (photo.syncStatus === 'pending' || photo.syncStatus === 'uploading') && (
-        <div 
-          className="absolute bottom-1 right-1 px-1.5 py-0.5 rounded-md bg-black/70 backdrop-blur-xs text-white text-[9px] font-bold flex items-center gap-1 shadow-sm pointer-events-none"
-          title={photo.syncStatus === 'uploading' ? 'Sincronizando foto...' : 'Foto guardada localmente (pendiente de sincronización)'}
-        >
-          <CloudUpload size={10} className={photo.syncStatus === 'uploading' ? 'animate-bounce' : 'opacity-80'} />
-          <span className="text-[8px] uppercase">{photo.syncStatus === 'uploading' ? 'Subiendo' : 'Local'}</span>
-        </div>
+        hasSyncError ? (
+          <div 
+            className="absolute bottom-1 right-1 px-1.5 py-0.5 rounded-md bg-red-600 text-white text-[9px] font-bold flex items-center gap-1 shadow-sm cursor-help pointer-events-auto"
+            title={syncErrorTooltip}
+          >
+            <AlertCircle size={10} className="shrink-0" />
+            <span className="text-[8px] uppercase">Error</span>
+          </div>
+        ) : (
+          <div 
+            className="absolute bottom-1 right-1 px-1.5 py-0.5 rounded-md bg-black/70 backdrop-blur-xs text-white text-[9px] font-bold flex items-center gap-1 shadow-sm pointer-events-none"
+            title={photo.syncStatus === 'uploading' ? 'Sincronizando foto...' : 'Foto guardada localmente (pendiente de sincronización)'}
+          >
+            <CloudUpload size={10} className={photo.syncStatus === 'uploading' ? 'animate-bounce' : 'opacity-80'} />
+            <span className="text-[8px] uppercase">{photo.syncStatus === 'uploading' ? 'Subiendo' : 'Local'}</span>
+          </div>
+        )
       )}
     </div>
   );

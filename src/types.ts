@@ -178,4 +178,6 @@ export interface Inventory {
   assignedAt?: number;
   assignedBy?: string;
   assignmentHistory?: { to: string | null; toName: string | null; by: string; byName: string; at: number }[];
+  photoMeta?: Record<string, { url: string; storagePath: string; spaceId?: string; timestamp?: number; caption?: string; syncedAt: number }>;
+  completedAt?: number;
 }
