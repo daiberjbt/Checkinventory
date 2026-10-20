@@ -42,20 +42,8 @@ jobs:
         run: |
           if [ ! -d android ]; then npx cap add android; fi
 
-      - name: Permisos de cámara y micrófono
-        run: |
-          python3 - <<'PY'
-          import pathlib
-          p = pathlib.Path('android/app/src/main/AndroidManifest.xml')
-          s = p.read_text()
-          add = ''
-          for perm in ['ACCESS_NETWORK_STATE', 'CAMERA', 'RECORD_AUDIO']:
-              if f'android.permission.{perm}"' not in s:
-                  add += f'    <uses-permission android:name="android.permission.{perm}" />\n'
-          if 'android.hardware.camera"' not in s:
-              add += '    <uses-feature android:name="android.hardware.camera" android:required="false" />\n'
-          p.write_text(s.replace('</manifest>', add + '</manifest>'))
-          PY
+      - name: Preparar proyecto Android (permisos, firma y versión)
+        run: python3 android-patch.py --android
 
       - run: npx cap sync android
 
