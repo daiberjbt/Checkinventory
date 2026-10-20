@@ -9,6 +9,7 @@ android-patch.py  -  Adapta la app web exportada de AI Studio para correr como a
 - Se ejecuta solo desde el workflow de GitHub Actions: no hay que correrlo a mano.
 """
 import json
+import os
 import pathlib
 import re
 import sys
@@ -27,15 +28,19 @@ def write(p, s):
 
 
 def patch_file(path, edits, regex_edits=()):
-    """edits: lista de (viejo, nuevo, veces_esperadas)."""
+    """edits: lista de (viejo, nuevo, veces_esperadas). veces_esperadas puede ser un entero o un conjunto, p. ej. {0, 1} = opcional."""
     s = read(path)
     if MARK in s:
         print(f'= {path}: ya estaba parchado')
         return
     for old, new, expected in edits:
+        allowed = {expected} if isinstance(expected, int) else set(expected)
         n = s.count(old)
-        if n != expected:
-            errors.append(f'{path}: se esperaban {expected} coincidencia(s) y hay {n} para:\n    {old[:110]!r}')
+        if n not in allowed:
+            errors.append(f'{path}: se esperaban {sorted(allowed)} coincidencia(s) y hay {n} para:\n    {old[:110]!r}')
+            continue
+        if n == 0:
+            print(f'  (opcional, no aplica en {path}): {old[:60]!r}')
             continue
         s = s.replace(old, new)
     for fn in regex_edits:
@@ -46,6 +51,76 @@ def patch_file(path, edits, regex_edits=()):
     if not errors:
         write(path, MARK + '\n' + s)
         print(f'+ {path}: parchado')
+
+
+# ---------------------------------------------------------------- modo --android (despues de "cap add android")
+SIGNING_GRADLE = """    signingConfigs {
+        debug {
+            // Llave fija: asi cada APK nuevo se instala ENCIMA del anterior sin desinstalar (no se pierden datos locales)
+            storeFile file('checkinventory-debug.keystore')
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+            storeType 'PKCS12'
+        }
+    }
+"""
+
+
+def android_post():
+    import shutil
+    failed = []
+    # 1) Permisos de camara y microfono
+    mp = pathlib.Path('android/app/src/main/AndroidManifest.xml')
+    m = mp.read_text(encoding='utf-8')
+    add = ''
+    for perm in ['ACCESS_NETWORK_STATE', 'CAMERA', 'RECORD_AUDIO']:
+        if f'android.permission.{perm}"' not in m:
+            add += f'    <uses-permission android:name="android.permission.{perm}" />\n'
+    if 'android.hardware.camera"' not in m:
+        add += '    <uses-feature android:name="android.hardware.camera" android:required="false" />\n'
+    if add:
+        mp.write_text(m.replace('</manifest>', add + '</manifest>'), encoding='utf-8')
+        print('+ AndroidManifest.xml: permisos agregados')
+    else:
+        print('= AndroidManifest.xml: permisos ya estaban')
+
+    # 2) Firma fija (si existe checkinventory-debug.keystore en la raiz del repositorio)
+    ks = pathlib.Path('checkinventory-debug.keystore')
+    gradle = pathlib.Path('android/app/build.gradle')
+    if ks.exists():
+        shutil.copy(ks, 'android/app/checkinventory-debug.keystore')
+        g = gradle.read_text(encoding='utf-8')
+        if 'checkinventory-debug.keystore' in g:
+            print('= build.gradle: firma fija ya estaba')
+        elif g.count('    buildTypes {') != 1:
+            failed.append('android/app/build.gradle: no se encontro el bloque buildTypes para insertar la firma fija')
+        else:
+            gradle.write_text(g.replace('    buildTypes {', SIGNING_GRADLE + '    buildTypes {', 1), encoding='utf-8')
+            print('+ build.gradle: firma fija configurada')
+    else:
+        print('  (aviso) falta checkinventory-debug.keystore en la raiz del repositorio: el APK se firmara con una llave temporal')
+        print('          distinta en cada compilacion y habra que desinstalar la version anterior para instalarlo.')
+    # 3) Numero de version creciente (numero de ejecucion de GitHub): Android lo acepta como actualizacion
+    run = os.environ.get('GITHUB_RUN_NUMBER', '').strip()
+    if run.isdigit():
+        g = gradle.read_text(encoding='utf-8')
+        g2 = re.sub(r'versionCode\s+\d+', f'versionCode {run}', g, count=1)
+        g2 = re.sub(r'versionName\s+"[^"]*"', f'versionName "1.0.{run}"', g2, count=1)
+        if g2 != g:
+            gradle.write_text(g2, encoding='utf-8')
+            print(f'+ build.gradle: versionCode {run}')
+    if failed:
+        print('\n*** ERROR ***')
+        for f in failed:
+            print(' -', f)
+        sys.exit(1)
+    print('\nOK: proyecto Android preparado')
+
+
+if '--android' in sys.argv:
+    android_post()
+    sys.exit(0)
 
 
 # ---------------------------------------------------------------- archivos nuevos
@@ -311,10 +386,14 @@ export const deleteDoc = ((...args: any[]) => queuedWrite((_deleteDoc as any)(..
 CAP_CONFIG = """import type { CapacitorConfig } from '@capacitor/cli';
 
 const config: CapacitorConfig = {
-  appId: 'com.checkinventory.app',
-  appName: 'CheckInventory',
+  appId: '__APP_ID__',
+  appName: '__APP_NAME__',
   webDir: 'dist',
   android: { allowMixedContent: false },
+  plugins: {
+    // La web NO se dibuja debajo de la barra de estado ni de la barra de navegacion
+    SystemBars: { insetsHandling: 'css', initialViewportFitValueHint: 'contain' },
+  },
 };
 
 export default config;
@@ -324,9 +403,26 @@ for path, content in [('src/native.ts', NATIVE_TS), ('src/zipStream.ts', ZIPSTRE
                       ('src/offlineWrites.ts', OFFLINE_WRITES_TS)]:
     write(path, content)
     print(f'+ {path}: escrito')
-if not ROOT.joinpath('capacitor.config.ts').exists():
-    write('capacitor.config.ts', CAP_CONFIG)
-    print('+ capacitor.config.ts: escrito')
+# capacitor.config.ts: se reescribe siempre, pero conservando el appId y el nombre que ya hubiera
+app_id, app_name = 'com.checkinventory.app', 'CheckInventory'
+if ROOT.joinpath('capacitor.config.ts').exists():
+    old_cfg_text = read('capacitor.config.ts')
+    m_id = re.search(r"appId:\s*['\"]([^'\"]+)['\"]", old_cfg_text)
+    m_nm = re.search(r"appName:\s*['\"]([^'\"]+)['\"]", old_cfg_text)
+    app_id = m_id.group(1) if m_id else app_id
+    app_name = m_nm.group(1) if m_nm else app_name
+write('capacitor.config.ts', CAP_CONFIG.replace('__APP_ID__', app_id).replace('__APP_NAME__', app_name))
+print(f'+ capacitor.config.ts: escrito (appId {app_id})')
+
+# index.html: la web no debe extenderse bajo las barras del sistema
+html = read('index.html')
+if re.search(r'viewport-fit\s*=\s*cover', html):
+    write('index.html', re.sub(r'viewport-fit\s*=\s*cover', 'viewport-fit=contain', html))
+    print('+ index.html: viewport-fit=contain')
+elif 'viewport-fit=contain' in html:
+    print('= index.html: ya estaba en viewport-fit=contain')
+else:
+    print('  (aviso) index.html no declara viewport-fit; no se modifica')
 
 # ---------------------------------------------------------------- src/main.tsx
 patch_file('src/main.tsx', [
@@ -422,6 +518,9 @@ patch_file('src/App.tsx', [
                           const blob = await response.blob();""",
      """                          const blob = await fetchBlob(fullscreenPhoto.url);
                           if (!blob) throw new Error('No se pudo descargar la foto');""", 1),
+    # respaldo: el encabezado fijo respeta la barra de estado (si viewport-fit ya lo resuelve, el margen es 0)
+    ('<div className="sticky top-0 z-50">',
+     '<div className="sticky top-0 z-50 bg-white" style={{ paddingTop: \'env(safe-area-inset-top, 0px)\' }}>', {0, 1}),
     # enlaces / origen del servidor
     ("origin: window.location.origin\n", "origin: webOrigin()\n", 1),
     ("`${window.location.origin}/?downloadPhotos=", "`${webOrigin()}/?downloadPhotos=", 1),
