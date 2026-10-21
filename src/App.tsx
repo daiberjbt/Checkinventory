@@ -65,7 +65,9 @@ import {
   Link2,
   UserCheck,
   Clock,
-  ShieldCheck
+  ShieldCheck,
+  CloudUpload,
+  RefreshCw
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { v4 as uuidv4 } from 'uuid';
@@ -74,14 +76,30 @@ import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import JSZip from 'jszip';
 import { saveAs } from 'file-saver';
-import { Inventory, InventorySpace, InventoryItem, Photo, User, Annex, InventoryTemplate, TemplateSpace, PropertyType, License, OfflinePhotoRecord, SUPER_ADMIN_EMAIL } from './types';
+import { Inventory, InventorySpace, InventoryItem, Photo, User, Annex, InventoryTemplate, TemplateSpace, PropertyType, License, OfflinePhotoRecord, SUPER_ADMIN_EMAIL, InventoryPhotoDoc } from './types';
 import { SignaturePad } from './components/SignaturePad';
 import { Auth } from './components/Auth';
 import { PublicRemoteSignPage } from './components/PublicRemoteSignPage';
 import { PhotoThumb, getPhotoDisplayUrl } from './components/PhotoThumb';
 import { OwnerPanel } from './components/OwnerPanel';
 import { PhotoSyncEngine, photoSyncEngine } from './lib/photoSyncEngine';
-import { savePendingPhoto, deletePhotoRecord, markPhotoDeleted, getPhotoBlob } from './lib/offlinePhotoDb';
+import { 
+  subscribePhotos, 
+  fetchPhotos, 
+  deleteAllPhotos, 
+  getPhotosOf, 
+  stripPhotosForSave 
+} from './photos';
+import { 
+  savePendingPhoto, 
+  deletePhotoRecord, 
+  markPhotoDeleted, 
+  getPhotoBlob,
+  getPendingPhotosByAdminUid,
+  getPendingPhotosByInventory,
+  getPendingPhoto,
+  updatePhotoRecord 
+} from './lib/offlinePhotoDb';
 import { auth, db, storage } from './firebase';
 import { onAuthStateChanged, signOut, sendEmailVerification } from 'firebase/auth';
 import { 
@@ -316,8 +334,13 @@ export const sanitizeInventory = (inventory: any): any => {
         : [],
       createdAt: typeof annex.createdAt === 'number' ? annex.createdAt : Date.now(),
       createdBy: annex.createdBy || '',
-      creatorName: annex.creatorName || ''
+      creatorName: annex.creatorName || '',
+      photoCount: typeof annex.photoCount === 'number' ? annex.photoCount : (Array.isArray(annex.photos) ? annex.photos.length : 0)
     }));
+  }
+
+  if (typeof inventory.photoCount === 'number') {
+    cleaned.photoCount = inventory.photoCount;
   }
 
   return cleaned;
@@ -377,6 +400,14 @@ export default function App() {
   useEffect(() => {
     currentInventoryRef.current = currentInventory;
   }, [currentInventory]);
+
+  // Estados de fotografías para subcolecciones de Firestore e IndexedDB
+  const [subcollectionPhotos, setSubcollectionPhotos] = useState<InventoryPhotoDoc[]>([]);
+  const [pendingLocalPhotos, setPendingLocalPhotos] = useState<OfflinePhotoRecord[]>([]);
+  const [globalPendingPhotos, setGlobalPendingPhotos] = useState<OfflinePhotoRecord[]>([]);
+  const [isRetryingSync, setIsRetryingSync] = useState(false);
+  const [expandedGalleries, setExpandedGalleries] = useState<Record<string, boolean>>({});
+
   const [showAssignModal, setShowAssignModal] = useState(false);
   const [assigningInventory, setAssigningInventory] = useState<Inventory | null>(null);
   const [selectedDependentForAssign, setSelectedDependentForAssign] = useState<string | null>(null);
@@ -500,6 +531,82 @@ export default function App() {
       window.removeEventListener('offline', handleOffline);
     };
   }, []);
+
+  // 1. Escuchar la subcolección photos del inventario abierto en tiempo real (detalle, edición, recepción)
+  useEffect(() => {
+    if (!currentInventory?.id || view === 'list' || view === 'settings' || view === 'owner' || view === 'dependents') {
+      setSubcollectionPhotos([]);
+      setPendingLocalPhotos([]);
+      return;
+    }
+
+    const inventoryId = currentInventory.id;
+
+    // Escuchar subcolección con onSnapshot (Requirement 8)
+    const unsubscribe = subscribePhotos(inventoryId, (photos) => {
+      setSubcollectionPhotos(photos);
+    });
+
+    // Cargar fotos locales pendientes de IndexedDB para este inventario
+    const refreshPending = async () => {
+      try {
+        const records = await getPendingPhotosByInventory(inventoryId);
+        setPendingLocalPhotos(records);
+      } catch (e) {
+        console.warn('Error al cargar fotos locales pendientes para el inventario:', e);
+      }
+    };
+
+    refreshPending();
+
+    // Actualizar cuando el syncEngine notifique cambios
+    const unsubSync = photoSyncEngine.subscribe((event) => {
+      if (event.inventoryId === inventoryId || event.type === 'sync_finished' || event.type === 'photo_synced') {
+        refreshPending();
+      }
+    });
+
+    return () => {
+      unsubscribe();
+      unsubSync();
+    };
+  }, [currentInventory?.id, view]);
+
+  // 2. Banner global: Monitorear fotos pendientes de subir a la nube en IndexedDB (Requirement 12)
+  useEffect(() => {
+    if (!currentUser) {
+      setGlobalPendingPhotos([]);
+      return;
+    }
+
+    const tenantAdminUid = currentUser.role === 'admin'
+      ? currentUser.id
+      : (currentUser.adminUid || currentUser.id);
+
+    if (!tenantAdminUid) return;
+
+    const refreshGlobalPending = async () => {
+      try {
+        const records = await getPendingPhotosByAdminUid(tenantAdminUid);
+        setGlobalPendingPhotos(records);
+      } catch (e) {
+        console.warn('Error consultando fotos pendientes globales:', e);
+      }
+    };
+
+    refreshGlobalPending();
+
+    const unsubSync = photoSyncEngine.subscribe(() => {
+      refreshGlobalPending();
+    });
+
+    const interval = setInterval(refreshGlobalPending, 15000);
+
+    return () => {
+      unsubSync();
+      clearInterval(interval);
+    };
+  }, [currentUser?.id, currentUser?.role, currentUser?.adminUid]);
 
   useEffect(() => {
     const handlePopState = (event: PopStateEvent) => {
@@ -1609,7 +1716,7 @@ export default function App() {
         console.warn('Error reading blob from IndexedDB for ZIP:', e);
       }
     }
-    const targetUrl = photo.url || (photo.dataUrl?.startsWith('http') ? photo.dataUrl : null);
+    const targetUrl = photo.url || photo.thumbUrl || (photo.dataUrl?.startsWith('http') ? photo.dataUrl : null);
     if (targetUrl) {
       try {
         const response = await fetch(targetUrl);
@@ -1636,54 +1743,67 @@ export default function App() {
       navigateTo('settings');
       return;
     }
-    const zip = new JSZip();
-    const propertyFolder = zip.folder(`Fotos_${inventory.propertyName.replace(/\s+/g, '_')}`);
-    
-    if (!propertyFolder) return;
+    setIsDownloadingPhotos(true);
+    try {
+      const zip = new JSZip();
+      const propertyFolder = zip.folder(`Fotos_${inventory.propertyName.replace(/\s+/g, '_')}`);
+      
+      if (!propertyFolder) return;
 
-    for (const space of inventory.spaces) {
-      if (space.photos.length > 0) {
-        const spaceFolderName = space.title.replace(/[/\\?%*:|"<>]/g, '-');
-        const spaceFolder = propertyFolder.folder(spaceFolderName);
-        
-        if (!spaceFolder) continue;
+      // Obtener fotos sincronizadas de la subcolección además de las antiguas (Requirement 10)
+      const subcollectionDocs = await fetchPhotos(inventory.id);
 
-        for (let i = 0; i < space.photos.length; i++) {
-          const photo = space.photos[i];
-          const photoData = await getPhotoDataForZip(photo);
-          const fileName = `foto_${i + 1}_${photo.id.substring(0, 5)}.jpg`;
-          if (photoData?.type === 'blob') {
-            spaceFolder.file(fileName, photoData.blob);
-          } else if (photoData?.type === 'base64') {
-            spaceFolder.file(fileName, photoData.data, { base64: true });
-          }
-        }
-      }
-    }
+      for (const space of inventory.spaces) {
+        const spacePhotos = getPhotosOf(space, subcollectionDocs, []);
+        if (spacePhotos.length > 0) {
+          const spaceFolderName = space.title.replace(/[/\\?%*:|"<>]/g, '-');
+          const spaceFolder = propertyFolder.folder(spaceFolderName);
+          
+          if (!spaceFolder) continue;
 
-    // Add Annex photos if they exist
-    if (inventory.annexes && inventory.annexes.length > 0) {
-      const annexFolder = propertyFolder.folder('Anexos');
-      if (annexFolder) {
-        let photoCounter = 1;
-        for (const annex of inventory.annexes) {
-          for (const photo of annex.photos) {
+          for (let i = 0; i < spacePhotos.length; i++) {
+            const photo = spacePhotos[i];
             const photoData = await getPhotoDataForZip(photo);
-            const fileName = `anexo_foto_${photoCounter}_${photo.id.substring(0, 5)}.jpg`;
+            const fileName = `foto_${i + 1}_${photo.id.substring(0, 5)}.jpg`;
             if (photoData?.type === 'blob') {
-              annexFolder.file(fileName, photoData.blob);
+              spaceFolder.file(fileName, photoData.blob);
             } else if (photoData?.type === 'base64') {
-              annexFolder.file(fileName, photoData.data, { base64: true });
+              spaceFolder.file(fileName, photoData.data, { base64: true });
             }
-            photoCounter++;
           }
         }
       }
-    }
 
-    const content = await zip.generateAsync({ type: 'blob' });
-    saveAs(content, `Fotos_Inventario_${inventory.propertyName.replace(/\s+/g, '_')}.zip`);
-    showNotify('Fotos descargadas correctamente');
+      // Add Annex photos if they exist
+      if (inventory.annexes && inventory.annexes.length > 0) {
+        const annexFolder = propertyFolder.folder('Anexos');
+        if (annexFolder) {
+          let photoCounter = 1;
+          for (const annex of inventory.annexes) {
+            const annexPhotosList = getPhotosOf(annex, subcollectionDocs, []);
+            for (const photo of annexPhotosList) {
+              const photoData = await getPhotoDataForZip(photo);
+              const fileName = `anexo_foto_${photoCounter}_${photo.id.substring(0, 5)}.jpg`;
+              if (photoData?.type === 'blob') {
+                annexFolder.file(fileName, photoData.blob);
+              } else if (photoData?.type === 'base64') {
+                annexFolder.file(fileName, photoData.data, { base64: true });
+              }
+              photoCounter++;
+            }
+          }
+        }
+      }
+
+      const content = await zip.generateAsync({ type: 'blob' });
+      saveAs(content, `Fotos_Inventario_${inventory.propertyName.replace(/\s+/g, '_')}.zip`);
+      showNotify('Fotos descargadas correctamente');
+    } catch (err: any) {
+      console.error('Error generating ZIP:', err);
+      showNotify('Error al generar archivo ZIP de fotos', 'error');
+    } finally {
+      setIsDownloadingPhotos(false);
+    }
   };
 
   const confirmAction = (title: string, message: string, onConfirm: () => void) => {
@@ -1787,6 +1907,23 @@ export default function App() {
 
       const inventoryRef = doc(db, 'inventories', inventoryId);
       const existingInventory = inventories.find(i => i.id === inventoryId);
+
+      // Calcular conteo total conocido de fotos para photoCount (Requirement 1 & 2)
+      const knownSpacePhotosCount = (cleanInventory.spaces || []).reduce((acc: number, s: any) => {
+        return acc + getPhotosOf(s, subcollectionPhotos, pendingLocalPhotos).length;
+      }, 0);
+      const knownAnnexPhotosCount = (cleanInventory.annexes || []).reduce((acc: number, a: any) => {
+        return acc + (typeof a.photoCount === 'number' ? a.photoCount : getPhotosOf(a, subcollectionPhotos, pendingLocalPhotos).length);
+      }, 0);
+      const totalKnownPhotoCount = knownSpacePhotosCount + knownAnnexPhotosCount;
+
+      // Despojar fotos no históricas: NUNCA re-incrustar fotos de subcolección o marcadores locales
+      const stripped = stripPhotosForSave(cleanInventory, existingInventory, totalKnownPhotoCount);
+      data.spaces = stripped.spaces;
+      if (stripped.annexes) {
+        data.annexes = stripped.annexes;
+      }
+      data.photoCount = stripped.photoCount;
       
       if (!existingInventory) {
         const newDocData = sanitizeInventory({
@@ -1814,6 +1951,7 @@ export default function App() {
             updatedAt: Date.now()
           };
           if (data.annexes) safeUpdate.annexes = data.annexes;
+          if (typeof data.photoCount === 'number') safeUpdate.photoCount = data.photoCount;
           if (data.status === 'archived') safeUpdate.status = 'archived';
           if (data.tenantReceiveDate) safeUpdate.tenantReceiveDate = data.tenantReceiveDate;
           if (data.tenantReceiveText) safeUpdate.tenantReceiveText = data.tenantReceiveText;
@@ -2162,6 +2300,16 @@ export default function App() {
         return;
       }
 
+      // Aviso no bloqueante si hay fotos pendientes de subir a la nube (Requirement 12)
+      try {
+        const pendingPhotos = await getPendingPhotosByInventory(currentInventory.id);
+        if (pendingPhotos.length > 0) {
+          showNotify(`Aviso: Hay ${pendingPhotos.length} fotografía(s) pendientes de subir a la nube. Se sincronizarán automáticamente en segundo plano.`, 'warning');
+        }
+      } catch (e) {
+        console.warn('Error verificando fotos pendientes en confirmFinalSave:', e);
+      }
+
       const inventoryToSave: Inventory = { 
         ...currentInventory, 
         status: 'completed',
@@ -2185,10 +2333,17 @@ export default function App() {
   };
 
   const deleteInventoryPhotos = async (inventory: Inventory) => {
+    // 1. Borrar primero su subcolección photos en lotes de 400 (Requirement 11)
+    try {
+      await deleteAllPhotos(inventory.id);
+    } catch (e) {
+      console.warn('Error borrando subcolección photos en lotes:', e);
+    }
+
     const allPhotos: Photo[] = [];
-    inventory.spaces.forEach(s => allPhotos.push(...s.photos));
+    (inventory.spaces || []).forEach(s => allPhotos.push(...(s.photos || [])));
     if (inventory.annexes) {
-      inventory.annexes.forEach(a => allPhotos.push(...a.photos));
+      inventory.annexes.forEach(a => allPhotos.push(...(a.photos || [])));
     }
 
     for (const photo of allPhotos) {
@@ -2772,13 +2927,22 @@ export default function App() {
     const sanitizedDoc = sanitizeInventory({ ...currentInventory, spaces: updatedSpaces });
     const sanitizedSpaces = sanitizedDoc.spaces;
 
-    // Update local state immediately
+    // Actualizar estado local inmediatamente
     setCurrentInventory(prev => prev ? { ...prev, spaces: updatedSpaces } : null);
     setInventories(prev => prev.map(inv => 
       inv.id === currentInventory.id ? { ...inv, spaces: updatedSpaces } : inv
     ));
+    setSubcollectionPhotos(prev => prev.filter(p => p.id !== photoId));
+    setPendingLocalPhotos(prev => prev.filter(p => p.id !== photoId));
 
-    // Remove from IndexedDB queue if pending
+    // 1. Borrar de la subcolección de Firestore si existe allí
+    try {
+      await deleteDoc(doc(db, 'inventories', currentInventory.id, 'photos', photoId));
+    } catch (subErr) {
+      // No existía en la subcolección (estaba solo en local)
+    }
+
+    // 2. Eliminar de IndexedDB si estaba pendiente
     try {
       await markPhotoDeleted(photoId);
       await deletePhotoRecord(photoId);
@@ -2786,7 +2950,7 @@ export default function App() {
       console.warn('Error deleting pending photo from IndexedDB:', e);
     }
 
-    // Persist to Firestore if document exists
+    // 3. Persistir en Firestore si era una foto antigua embebida en spaces
     try {
       const inventoryRef = doc(db, 'inventories', currentInventory.id);
       const isExistingInState = inventories.some(i => i.id === currentInventory.id);
@@ -2797,7 +2961,7 @@ export default function App() {
         });
       }
 
-      // If photo was in Storage, delete the file
+      // 4. Si la foto estaba en Storage, eliminar archivo y miniatura
       const targetUrl = photoToDelete?.url || photoToDelete?.dataUrl;
       if (targetUrl && targetUrl.startsWith('http')) {
         try {
@@ -2805,6 +2969,10 @@ export default function App() {
           const pathPart = decodedUrl.split('/o/')[1].split('?')[0];
           const photoRef = ref(storage, pathPart);
           await deleteObject(photoRef);
+          if (pathPart.endsWith('.jpg')) {
+            const thumbRef = ref(storage, pathPart.replace(/\.jpg$/, '_thumb.jpg'));
+            await deleteObject(thumbRef).catch(() => {});
+          }
         } catch (e) {
           console.warn('Could not delete photo file from storage:', e);
         }
@@ -2831,10 +2999,30 @@ export default function App() {
 
     setIsSavingAnnex(true);
     try {
+      const newAnnexId = uuidv4();
+      const annexPhotoCount = annexPhotos.length;
+
+      // Actualizar los registros de IndexedDB para asociarlos con newAnnexId (Requirement 4)
+      for (const p of annexPhotos) {
+        try {
+          const rec = await getPendingPhoto(p.id);
+          if (rec) {
+            rec.annexId = newAnnexId;
+            rec.isAnnex = true;
+            delete rec.spaceId;
+            await updatePhotoRecord(rec);
+          }
+        } catch (e) {
+          console.warn('Error asociando foto pendiente al anexo:', p.id, e);
+        }
+      }
+
+      // El documento de anexo en Firestore lleva photoCount y NO incrusta fotos nuevas (Requirement 1 & 4)
       const newAnnex: Annex = {
-        id: uuidv4(),
+        id: newAnnexId,
         text: annexText.trim(),
-        photos: annexPhotos,
+        photos: [], // NO re-incrustar fotos en Firestore (Requirement 1)
+        photoCount: annexPhotoCount,
         createdAt: Date.now(),
         createdBy: currentUser.id,
         creatorName: `${currentUser.firstName || ''} ${currentUser.lastName || ''}`.trim() || currentUser.email || 'Usuario'
@@ -2859,6 +3047,11 @@ export default function App() {
       setInventories(prev => prev.map(inv => 
         inv.id === currentInventory.id ? updatedInventory : inv
       ));
+
+      // Disparar sincronización para subir fotos del anexo a la subcolección con annexId (Requirement 4)
+      photoSyncEngine.triggerSync().catch(err => {
+        console.warn('[SyncEngine] Error triggering sync after annex creation:', err);
+      });
 
       setAnnexText('');
       setAnnexPhotos([]);
@@ -3444,14 +3637,18 @@ export default function App() {
           });
           currentY += 5;
 
-          if (annex.photos && annex.photos.length > 0) {
+          const annexPhotosCount = typeof annex.photoCount === 'number' 
+            ? annex.photoCount 
+            : (Array.isArray(annex.photos) ? annex.photos.length : 0);
+
+          if (annexPhotosCount > 0) {
             if (currentY > 280) {
               doc.addPage();
               currentY = 20;
             }
             doc.setFontSize(9);
             doc.setFont('helvetica', 'italic');
-            doc.text(`(Este anexo incluye ${annex.photos.length} fotos adicionales en el registro digital)`, 14, currentY);
+            doc.text(`(Este anexo incluye ${annexPhotosCount} fotos adicionales en el registro digital)`, 14, currentY);
             currentY += 10;
           }
           
@@ -4650,6 +4847,46 @@ export default function App() {
       </AnimatePresence>
 
       <div className="sticky top-0 z-50">
+        {/* Banner Global de Fotos Pendientes de Sincronización (Requirement 12) */}
+        {globalPendingPhotos.length > 0 && (
+          <div className="bg-amber-500/10 dark:bg-amber-950/40 border-b border-amber-500/20 text-amber-950 dark:text-amber-200 px-3 sm:px-6 py-2 text-xs flex flex-wrap items-center justify-between gap-2 backdrop-blur-md">
+            <div className="flex items-center gap-2 min-w-0">
+              <CloudUpload size={16} className="text-amber-600 dark:text-amber-400 shrink-0 animate-pulse" />
+              <span className="font-bold whitespace-nowrap">
+                {globalPendingPhotos.length} {globalPendingPhotos.length === 1 ? 'foto sin subir' : 'fotos sin subir'} a la nube
+              </span>
+              <span className="opacity-40 hidden sm:inline">•</span>
+              <span className="text-[11px] opacity-80 truncate hidden sm:inline">
+                {(() => {
+                  if (!isOnline) return 'Esperando conexión a Internet';
+                  const failed = globalPendingPhotos.find(p => p.status === 'failed' && p.lastError);
+                  if (failed?.lastError) return failed.lastError;
+                  return 'Sincronización en curso en segundo plano';
+                })()}
+              </span>
+            </div>
+            <button
+              type="button"
+              disabled={isRetryingSync}
+              onClick={async () => {
+                setIsRetryingSync(true);
+                try {
+                  await photoSyncEngine.triggerSync();
+                  showNotify('Iniciando subida de fotografías pendientes...', 'info');
+                } catch (e) {
+                  console.warn('Error al forzar sincronización:', e);
+                } finally {
+                  setTimeout(() => setIsRetryingSync(false), 2000);
+                }
+              }}
+              className="px-3 py-1 bg-amber-600 hover:bg-amber-700 active:scale-95 text-white rounded-lg text-[11px] font-bold shadow-sm transition-all disabled:opacity-50 shrink-0 flex items-center gap-1.5 cursor-pointer"
+            >
+              <RefreshCw size={12} className={isRetryingSync ? 'animate-spin' : ''} />
+              <span>{isRetryingSync ? 'Reintentando...' : 'Reintentar ahora'}</span>
+            </button>
+          </div>
+        )}
+
         {/* Header */}
         <header className="bg-white border-b border-black/5 px-3 sm:px-6 py-3 sm:py-4 flex items-center justify-between">
           <div className="flex items-center gap-2 sm:gap-3 cursor-pointer shrink-0" onClick={handleGoHome}>
@@ -4961,7 +5198,7 @@ export default function App() {
                         <div className="flex justify-between items-start mb-6">
                           <div className="flex flex-wrap gap-2 items-center">
                             <div className="bg-black/5 px-3 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-wider text-black/60">
-                              {inv.spaces.reduce((acc, s) => acc + s.photos.length, 0)} Fotos
+                              {typeof inv.photoCount === 'number' ? inv.photoCount : inv.spaces.reduce((acc, s) => acc + (s.photos?.length || 0), 0)} Fotos
                             </div>
                             {currentUser?.role === 'dependent' ? (
                               inv.assignedTo === currentUser.id ? (
@@ -6724,42 +6961,66 @@ export default function App() {
                         className="overflow-hidden"
                       >
                         <div className="pt-10 space-y-12">
-                          {currentInventory.spaces.map((space) => space.photos.length > 0 && (
-                            <div key={space.id} className="space-y-6">
-                              <div className="flex items-center gap-3">
-                                <div className="h-px flex-1 bg-black/5" />
-                                <h4 className="text-xs font-bold uppercase tracking-widest text-muted">{space.title}</h4>
-                                <div className="h-px flex-1 bg-black/5" />
-                              </div>
-                              <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-4">
-                                {space.photos.map((photo) => (
-                                  <div 
-                                    key={photo.id} 
-                                    onClick={async () => {
-                                      const displayUrl = await getPhotoDisplayUrl(photo);
-                                      setFullscreenPhoto({
-                                        url: displayUrl,
-                                        title: space.title,
-                                        date: format(photo.timestamp, 'dd/MM/yyyy HH:mm'),
-                                        canDelete: false
-                                      });
-                                    }}
-                                    className="aspect-square rounded-2xl overflow-hidden border border-black/5 group/photo relative cursor-pointer"
-                                  >
-                                    <PhotoThumb 
-                                      photo={photo} 
-                                      alt="Evidencia" 
-                                      className="w-full h-full object-cover transition-transform duration-500 group-hover/photo:scale-110"
-                                      showSyncBadge={true}
-                                    />
-                                    <div className="absolute inset-0 bg-black/20 opacity-0 group-hover/photo:opacity-100 transition-opacity flex items-center justify-center text-white">
-                                      <Maximize2 size={24} />
+                          {currentInventory.spaces.map((space) => {
+                            const spacePhotos = getPhotosOf(space, subcollectionPhotos, pendingLocalPhotos);
+                            if (spacePhotos.length === 0) return null;
+
+                            const isExpanded = !!expandedGalleries[`detail_${space.id}`];
+                            const displayedPhotos = (spacePhotos.length > 40 && !isExpanded)
+                              ? spacePhotos.slice(0, 24)
+                              : spacePhotos;
+
+                            return (
+                              <div key={space.id} className="space-y-6">
+                                <div className="flex items-center justify-between gap-3">
+                                  <div className="h-px flex-1 bg-black/5" />
+                                  <h4 className="text-xs font-bold uppercase tracking-widest text-muted">
+                                    {space.title} ({spacePhotos.length})
+                                  </h4>
+                                  <div className="h-px flex-1 bg-black/5" />
+                                </div>
+                                <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-4">
+                                  {displayedPhotos.map((photo) => (
+                                    <div 
+                                      key={photo.id} 
+                                      onClick={async () => {
+                                        const displayUrl = await getPhotoDisplayUrl(photo);
+                                        setFullscreenPhoto({
+                                          url: displayUrl,
+                                          title: space.title,
+                                          date: format(photo.timestamp, 'dd/MM/yyyy HH:mm'),
+                                          canDelete: false
+                                        });
+                                      }}
+                                      className="aspect-square rounded-2xl overflow-hidden border border-black/5 group/photo relative cursor-pointer"
+                                    >
+                                      <PhotoThumb 
+                                        photo={photo} 
+                                        alt="Evidencia" 
+                                        className="w-full h-full object-cover transition-transform duration-500 group-hover/photo:scale-110"
+                                        showSyncBadge={true}
+                                      />
+                                      <div className="absolute inset-0 bg-black/20 opacity-0 group-hover/photo:opacity-100 transition-opacity flex items-center justify-center text-white">
+                                        <Maximize2 size={24} />
+                                      </div>
                                     </div>
-                                  </div>
-                                ))}
+                                  ))}
+                                  {spacePhotos.length > 40 && !isExpanded && (
+                                    <div className="col-span-full pt-2">
+                                      <button
+                                        type="button"
+                                        onClick={() => setExpandedGalleries(prev => ({ ...prev, [`detail_${space.id}`]: true }))}
+                                        className="w-full py-3 px-4 bg-black/5 hover:bg-black/10 dark:bg-white/5 dark:hover:bg-white/10 rounded-2xl text-xs font-bold text-neutral-800 dark:text-neutral-200 transition-all flex items-center justify-center gap-2 cursor-pointer"
+                                      >
+                                        <ImageIcon size={16} />
+                                        Ver más ({spacePhotos.length - 24} fotografías restantes)
+                                      </button>
+                                    </div>
+                                  )}
+                                </div>
                               </div>
-                            </div>
-                          ))}
+                            );
+                          })}
                         </div>
                       </motion.div>
                     )}
@@ -6831,35 +7092,57 @@ export default function App() {
                                   </div>
                                 </div>
                                 <p className="text-sm text-black/80 leading-relaxed">{annex.text}</p>
-                                {annex.photos && annex.photos.length > 0 && (
-                                  <div className="grid grid-cols-3 sm:grid-cols-5 gap-3 pt-2">
-                                    {annex.photos.map((photo) => (
-                                      <div 
-                                        key={photo.id} 
-                                        onClick={async () => {
-                                          const displayUrl = await getPhotoDisplayUrl(photo);
-                                          setFullscreenPhoto({
-                                            url: displayUrl,
-                                            title: 'Foto de Anexo',
-                                            date: annex.createdAt ? new Date(annex.createdAt).toLocaleString() : undefined,
-                                            canDelete: false
-                                          });
-                                        }}
-                                        className="aspect-square rounded-xl overflow-hidden border border-black/5 cursor-pointer group/annex relative"
-                                      >
-                                        <PhotoThumb 
-                                          photo={photo} 
-                                          alt="Anexo" 
-                                          className="w-full h-full object-cover group-hover/annex:scale-110 transition-transform"
-                                          showSyncBadge={true}
-                                        />
-                                        <div className="absolute inset-0 bg-black/20 opacity-0 group-hover/annex:opacity-100 transition-opacity flex items-center justify-center text-white">
-                                          <Maximize2 size={16} />
-                                        </div>
+                                {(() => {
+                                  const annexPhotosList = getPhotosOf(annex, subcollectionPhotos, pendingLocalPhotos);
+                                  if (annexPhotosList.length === 0) return null;
+
+                                  const isAnnexExp = !!expandedGalleries[`detail_annex_${annex.id}`];
+                                  const displayedAnnexPhotos = (annexPhotosList.length > 40 && !isAnnexExp)
+                                    ? annexPhotosList.slice(0, 24)
+                                    : annexPhotosList;
+
+                                  return (
+                                    <div className="pt-2 space-y-3">
+                                      <div className="grid grid-cols-3 sm:grid-cols-5 gap-3">
+                                        {displayedAnnexPhotos.map((photo) => (
+                                          <div 
+                                            key={photo.id} 
+                                            onClick={async () => {
+                                              const displayUrl = await getPhotoDisplayUrl(photo);
+                                              setFullscreenPhoto({
+                                                url: displayUrl,
+                                                title: 'Foto de Anexo',
+                                                date: annex.createdAt ? new Date(annex.createdAt).toLocaleString() : undefined,
+                                                canDelete: false
+                                              });
+                                            }}
+                                            className="aspect-square rounded-xl overflow-hidden border border-black/5 cursor-pointer group/annex relative"
+                                          >
+                                            <PhotoThumb 
+                                              photo={photo} 
+                                              alt="Anexo" 
+                                              className="w-full h-full object-cover group-hover/annex:scale-110 transition-transform"
+                                              showSyncBadge={true}
+                                            />
+                                            <div className="absolute inset-0 bg-black/20 opacity-0 group-hover/annex:opacity-100 transition-opacity flex items-center justify-center text-white">
+                                              <Maximize2 size={16} />
+                                            </div>
+                                          </div>
+                                        ))}
                                       </div>
-                                    ))}
-                                  </div>
-                                )}
+                                      {annexPhotosList.length > 40 && !isAnnexExp && (
+                                        <button
+                                          type="button"
+                                          onClick={() => setExpandedGalleries(prev => ({ ...prev, [`detail_annex_${annex.id}`]: true }))}
+                                          className="w-full py-2.5 px-4 bg-black/5 hover:bg-black/10 dark:bg-white/5 dark:hover:bg-white/10 rounded-xl text-xs font-bold text-neutral-800 dark:text-neutral-200 transition-all flex items-center justify-center gap-2 cursor-pointer"
+                                        >
+                                          <ImageIcon size={14} />
+                                          Ver más ({annexPhotosList.length - 24} fotografías restantes)
+                                        </button>
+                                      )}
+                                    </div>
+                                  );
+                                })()}
                               </div>
                             ))}
                           </div>
@@ -7893,67 +8176,91 @@ export default function App() {
                                 </button>
                               </div>
 
-                              {space.photos.length === 0 ? (
-                                <div 
-                                  onClick={() => {
-                                    setTargetSpaceId(space.id);
-                                    setPhotoSourceModal({ open: true, spaceId: space.id, type: 'space' });
-                                  }}
-                                  className="border-2 border-dashed border-black/5 rounded-2xl p-10 text-center cursor-pointer hover:bg-black/[0.02] transition-all"
-                                >
-                                  <Camera size={24} className="mx-auto mb-2 opacity-20" />
-                                  <p className="text-[10px] text-muted font-bold uppercase tracking-wider">Añadir fotos (Cámara o Galería)</p>
-                                </div>
-                              ) : (
-                                <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 gap-3">
-                                  {space.photos.map((photo) => (
+                              {(() => {
+                                const spacePhotos = getPhotosOf(space, subcollectionPhotos, pendingLocalPhotos);
+                                const isExp = !!expandedGalleries[`create_${space.id}`];
+                                const displayedPhotos = (spacePhotos.length > 40 && !isExp)
+                                  ? spacePhotos.slice(0, 24)
+                                  : spacePhotos;
+
+                                if (spacePhotos.length === 0) {
+                                  return (
                                     <div 
-                                      key={photo.id} 
-                                      onClick={async () => {
-                                        const displayUrl = await getPhotoDisplayUrl(photo);
-                                        setFullscreenPhoto({
-                                          url: displayUrl,
-                                          title: space.title,
-                                          date: format(photo.timestamp, 'dd/MM/yyyy HH:mm'),
-                                          spaceId: space.id,
-                                          photoId: photo.id,
-                                          canDelete: currentInventory.status === 'draft'
-                                        });
+                                      onClick={() => {
+                                        setTargetSpaceId(space.id);
+                                        setPhotoSourceModal({ open: true, spaceId: space.id, type: 'space' });
                                       }}
-                                      className="relative group aspect-square rounded-xl overflow-hidden border border-black/5 shadow-sm cursor-pointer"
+                                      className="border-2 border-dashed border-black/5 rounded-2xl p-10 text-center cursor-pointer hover:bg-black/[0.02] transition-all"
                                     >
-                                      <PhotoThumb 
-                                        photo={photo} 
-                                        alt="Evidencia" 
-                                        className="w-full h-full object-cover group-hover:scale-110 transition-transform"
-                                        showSyncBadge={true}
-                                      />
-                                      <div className="absolute inset-0 bg-black/20 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-white">
-                                        <Maximize2 size={16} />
-                                      </div>
+                                      <Camera size={24} className="mx-auto mb-2 opacity-20" />
+                                      <p className="text-[10px] text-muted font-bold uppercase tracking-wider">Añadir fotos (Cámara o Galería)</p>
+                                    </div>
+                                  );
+                                }
+
+                                return (
+                                  <div className="space-y-3">
+                                    <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 gap-3">
+                                      {displayedPhotos.map((photo) => (
+                                        <div 
+                                          key={photo.id} 
+                                          onClick={async () => {
+                                            const displayUrl = await getPhotoDisplayUrl(photo);
+                                            setFullscreenPhoto({
+                                              url: displayUrl,
+                                              title: space.title,
+                                              date: format(photo.timestamp, 'dd/MM/yyyy HH:mm'),
+                                              spaceId: space.id,
+                                              photoId: photo.id,
+                                              canDelete: currentInventory.status === 'draft'
+                                            });
+                                          }}
+                                          className="relative group aspect-square rounded-xl overflow-hidden border border-black/5 shadow-sm cursor-pointer"
+                                        >
+                                          <PhotoThumb 
+                                            photo={photo} 
+                                            alt="Evidencia" 
+                                            className="w-full h-full object-cover group-hover:scale-110 transition-transform"
+                                            showSyncBadge={true}
+                                          />
+                                          <div className="absolute inset-0 bg-black/20 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-white">
+                                            <Maximize2 size={16} />
+                                          </div>
+                                          <button 
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              removePhoto(space.id, photo.id);
+                                            }}
+                                            className="absolute top-1 right-1 p-1 bg-white/90 rounded-md text-red-600 opacity-0 group-hover:opacity-100 transition-all shadow-sm z-10"
+                                            title="Eliminar foto"
+                                          >
+                                            <Trash2 size={12} />
+                                          </button>
+                                        </div>
+                                      ))}
                                       <button 
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          removePhoto(space.id, photo.id);
+                                        onClick={() => {
+                                          setTargetSpaceId(space.id);
+                                          setPhotoSourceModal({ open: true, spaceId: space.id, type: 'space' });
                                         }}
-                                        className="absolute top-1 right-1 p-1 bg-white/90 rounded-md text-red-600 opacity-0 group-hover:opacity-100 transition-all shadow-sm z-10"
-                                        title="Eliminar foto"
+                                        className="aspect-square border-2 border-dashed border-black/5 rounded-xl flex flex-col items-center justify-center text-muted hover:bg-black/[0.02] transition-all"
                                       >
-                                        <Trash2 size={12} />
+                                        <Plus size={16} />
                                       </button>
                                     </div>
-                                  ))}
-                                  <button 
-                                    onClick={() => {
-                                      setTargetSpaceId(space.id);
-                                      setPhotoSourceModal({ open: true, spaceId: space.id, type: 'space' });
-                                    }}
-                                    className="aspect-square border-2 border-dashed border-black/5 rounded-xl flex flex-col items-center justify-center text-muted hover:bg-black/[0.02] transition-all"
-                                  >
-                                    <Plus size={16} />
-                                  </button>
-                                </div>
-                              )}
+                                    {spacePhotos.length > 40 && !isExp && (
+                                      <button
+                                        type="button"
+                                        onClick={() => setExpandedGalleries(prev => ({ ...prev, [`create_${space.id}`]: true }))}
+                                        className="w-full py-2.5 px-4 bg-black/5 hover:bg-black/10 dark:bg-white/5 dark:hover:bg-white/10 rounded-xl text-xs font-bold text-neutral-800 dark:text-neutral-200 transition-all flex items-center justify-center gap-2 cursor-pointer"
+                                      >
+                                        <ImageIcon size={14} />
+                                        Ver más ({spacePhotos.length - 24} fotografías restantes)
+                                      </button>
+                                    )}
+                                  </div>
+                                );
+                              })()}
                             </div>
                           </div>
                         </motion.div>

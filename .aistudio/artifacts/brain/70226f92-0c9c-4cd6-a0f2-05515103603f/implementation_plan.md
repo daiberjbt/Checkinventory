@@ -1,142 +1,204 @@
-# Rediseño de Almacenamiento y Sincronización de Fotos a Gran Escala (Revisado)
+# Preparación de Datos para Consultas, Filtros y Búsqueda en el Servidor (Firestore)
 
-Plan de arquitectura e implementación para escalar el almacenamiento de fotografías a cientos de fotos por inventario desacoplándolas del documento principal mediante la subcolección `inventories/{id}/photos/{photoId}`, almacenamiento seguro en Firebase Storage según `storage.rules`, miniaturas optimizadas `_thumb`, subida concurrente (concurrencia 3), sincronización sin reescritura de inventarios y retrocompatibilidad estricta.
+Plan arquitectónico y técnico para preparar los inventarios con campos calculados derivados (`searchTokens`, `isReceived`, `isAssigned`), garantizar su mantenimiento síncrono en todas las operaciones del cliente y del servidor, crear e implementar índices compuestos en Firestore, proveer migración por lotes paginada para administradores y blindar las reglas de seguridad.
+
+---
+
+## User Review & Critical Decisions
 
 > [!IMPORTANT]
-> **Ajustes y Correcciones Confirmadas Incorporadas en Esta Revisión:**
-> 1. **NO Re-incrustar Fotos en Firestore**: En `saveInventory` y `confirmFinalSave`, `spaces[].photos` y `annexes[].photos` mantendrán **únicamente** las fotos históricas que ya venían embebidas en el documento antes de la migración. Nunca se re-incrustarán fotos de la subcolección ni fotos locales/pendientes (`localBlobId`, `pending`, `uploading`, `failed`).
-> 2. **Conteo en Tarjetas y PDF**: Las tarjetas de inventario y la generación del PDF utilizarán `photoCount` (a nivel inventario y `annex.photoCount` en cada anexo) en lugar de `spaces[].photos.length`.
-> 3. **Ruta Exacta en Storage**: Se usará estrictamente la ruta configurada en `storage.rules`:  
->    `tenants/{adminUid}/photos/{userUid}/{photoId}.jpg`  
->    `tenants/{adminUid}/photos/{userUid}/{photoId}_thumb.jpg`  
->    (confirmado que `storage.rules` ya valida y permite cualquier `fileName` de imagen en esa jerarquía).
-> 4. **Timestamp Estricto de Captura**: El `timestamp` guardado en el documento de la subcolección será **siempre** la fecha/hora en que se capturó la foto original (`record.createdAt` o `photo.timestamp`), nunca `Date.now()` al momento de la subida. Esto garantiza que las fotos capturadas durante la inspección antes de firmar sean admitidas por la regla de seguridad (`timestamp <= completedAt + 300000`).
-> 5. **Anexos con `photoCount`**: Al crear o editar un anexo se persistirá `annexes[i].photoCount` con el total de fotos del anexo. Sus fotos se suben a la subcolección con `annexId` (sin `spaceId`). El PDF y las tarjetas mostrarán `annex.photoCount`.
-> 6. **Fotos Pendientes Existentes y Fallback de Miniatura**: Los registros locales de IndexedDB que no tengan `thumbBlob` generarán su miniatura dinámicamente desde el blob original antes de subir. Si la generación en canvas falla, la foto se subirá sin `thumbUrl` (nunca se bloqueará una subida por falla de miniatura). Las fotos pendientes que hoy figuren en `spaces[].photos` con `pending`/`localBlobId` se enviarán a la subcolección usando su mismo ID original.
-> 7. **Reemplazo Total de `src/photos.ts`**: Se reescribe desde cero `src/photos.ts`, eliminando todo código o prototipo obsoleto y proveyendo utilidades puras y tipadas (`getPhotosOf`, `fetchPhotos`, `subscribePhotos`, `deleteAllPhotos`, `stripPhotosForSave`).
-> 8. **Reglas de Seguridad Exactas**: Se incorporan literalmente las reglas de `inventories/{inventoryId}/photos/{photoId}` solicitadas por el usuario y se actualiza `isValidInventory` para admitir `photoCount`.
+> Este plan se enfoca **exclusivamente** en la preparación de datos, infraestructura de base de datos y migración técnica. No modifica la apariencia visual existente de la aplicación ni la experiencia de usuario, salvo por la adición de la herramienta de optimización y migración en el Perfil de Administradores con su respectivo aviso de indexación pendiente.
+
+- **Campos Derivados**: `searchTokens`, `isReceived` e `isAssigned` son 100% deterministas y se recalculan automáticamente en todos los puntos de mutación.
+- **Rendimiento y Cuotas**: El límite de tokens se fija en un máximo estricto de 300 elementos por inventario para optimizar el tamaño de los documentos y el rendimiento de las consultas `array-contains`.
+- **Tolerancia a Fallos en Migración**: La migración se ejecuta en páginas de 50 documentos con lotes `writeBatch` de máximo 400 escrituras, garantizando idempotencia, reanudación ante caídas de red y feedback visual paso a paso.
 
 ---
 
-## 1. Visión General y Concepto Central
+## 1. Overview & Core Concept
 
-### Qué Resuelve
-Elimina la saturación del documento de inventario generada por transacciones sobre `spaces[].photos` durante la sincronización de fotos. Al transferir cada imagen a su propio documento en la subcolección `inventories/{inventoryId}/photos/{photoId}`, el documento padre permanece liviano e inmutable durante la subida, soportando cientos de fotos sin riesgo de alcanzar el límite de 1 MB ni provocar denegación de permisos en documentos completados.
+Actualmente, las consultas y filtros avanzados dependen de operaciones en memoria en el cliente tras descargar colecciones completas. Para permitir que el sistema escale a miles de inventarios por agencia sin degradación de latencia ni consumo excesivo de lecturas en Firestore, se requiere:
 
----
-
-## 2. Experiencia de Usuario y Diseño Visual
-
-### Banner Global de Fotos Pendientes
-- **Ubicación**: Visible en toda la app debajo del header.
-- **Información**: Conteo de fotos locales pendientes de sincronizar (`"N fotos pendientes de sincronizar con la nube"` o último motivo de fallo).
-- **Acción**: Botón *"Reintentar ahora"* que dispara `photoSyncEngine.triggerSync()`.
-
-### Aviso No Bloqueante en Finalización (`confirmFinalSave`)
-- Si hay fotos pendientes locales asociadas al inventario actual al presionar *"Finalizar y Firmar"*, se notifica al usuario con un diálogo informativo sin impedir la firma ni el guardado del acta.
-
-### Galerías y Visor de Fotos
-- **Miniaturas Ligeras**: `PhotoThumb` cargará `thumbUrl` en cuadrículas, con atributos `loading="lazy"` y `decoding="async"`. La URL original `url` se carga al abrir el visor fullscreen.
-- **Paginación Inteligente**: Si un espacio o anexo tiene más de 40 fotos, se renderizan 24 inicialmente con un botón interactivo *"Ver más (+N fotos)"*.
+1. **Campos Derivados de Alta Eficiencia**:
+   - `searchTokens`: Permite búsquedas textuales de prefijo instantáneas mediante consultas `array-contains` en Firestore.
+   - `isReceived`: Flag booleano (`true` si existe firma en acta de entrega o de recibido) para filtrar inventarios recibidos sin inspeccionar campos de firma voluminosos.
+   - `isAssigned`: Flag booleano (`true` si `assignedTo` está presente) para filtrar rápidamente asignaciones de dependientes.
+2. **Mantenimiento Reactivo Garantizado**:
+   - Todo flujo de guardado, finalización, firma remota, acta presencial o asignación actualiza estos campos de forma atómica.
+3. **Migración Histórica y Versionado**:
+   - Herramienta para que el administrador indexe el histórico existente en páginas de 50 registros por lotes seguros, marcando `searchIndexVersion: 1` en su perfil al completar.
 
 ---
 
-## 3. Modelo de Datos y Estrategia de Persistencia
+## 2. User Experience & Visual Design
 
-### Subcolección: `inventories/{inventoryId}/photos/{photoId}`
-```typescript
-export interface InventoryPhotoDoc {
-  id: string;                      // ID de la foto
-  spaceId?: string;                // ID del espacio (mutuamente excluyente con annexId)
-  annexId?: string;                // ID del anexo (mutuamente excluyente con spaceId)
-  storagePath: string;             // tenants/{adminUid}/photos/{userUid}/{photoId}.jpg
-  url: string;                     // URL de Firebase Storage
-  thumbUrl?: string;               // URL de tenants/{adminUid}/photos/{userUid}/{photoId}_thumb.jpg
-  caption?: string;                // Observación
-  timestamp: number;               // Timestamp original de captura
-  createdBy: string;               // UID del creador
-}
-```
+Conforme al requerimiento ("No cambies la interfaz ni nada más"), la interfaz se mantiene intacta con dos únicos agregados discretos en la vista de Perfil/Ajustes de administradores:
 
-### Limpieza al Guardar Inventario (`stripPhotosForSave`)
-Cuando `saveInventory` o `confirmFinalSave` envían datos a Firestore:
-1. `spaces[].photos`: Conserva **únicamente** fotos legacy que ya existían embebidas en Firestore (aquellas con `url` o `dataUrl` preexistentes en el documento remoto y sin `localBlobId`). Se excluyen todas las fotos de la subcolección y fotos con `syncStatus: 'pending'|'uploading'|'failed'`.
-2. `annexes[].photos`: Mismo criterio de conservación exclusiva de fotos legacy; actualiza `annex.photoCount`.
-3. `inventory.photoCount`: Total acumulado de fotos conocidas (legacy + subcolección + pendientes locales).
+1. **Aviso de Indexación Pendiente (Solo Administradores)**:
+   - Se muestra un banner informativo en la sección de configuración mientras `currentUser.searchIndexVersion !== 1`:
+     - *"Tu cuenta aún no tiene optimizada la base de datos para búsquedas rápidas. Ejecuta la optimización para acelerar las consultas."*
+2. **Botón y Modal de "Optimizar búsqueda"**:
+   - Botón accesible en el Perfil del Administrador.
+   - Al pulsar, abre un modal/panel de progreso con:
+     - Estado del proceso: *"Optimizando inventario X de Y..."*
+     - Barra de progreso porcentual fluida.
+     - Botón para reintentar en caso de pérdida de conexión (operación idempotente y repetible).
+     - Al completar exitosamente: guarda `searchIndexVersion: 1` en el documento del usuario en Firestore y emite notificación de éxito.
 
 ---
 
-## 4. Arquitectura del Sistema y Flujo de Datos
+## 3. Key Product Decisions & Trade-Offs
 
-### Diagrama de Flujo
+### Decisión 1: Algoritmo de Generación de `searchTokens`
+- **Algoritmo**:
+  1. Extrae los textos clave del inventario: `propertyName`, `address`, `internalCode`, `ownerName` y `tenantName`.
+  2. Normalización fonética/ortográfica: conversión a minúsculas, eliminación de marcas diacríticas/tildes (`normalize("NFD").replace(/[\u0300-\u036f]/g, "")`), y filtrado de caracteres no alfanuméricos.
+  3. Tokenización: división en palabras de 2 o más caracteres.
+  4. Generación de prefijos (n-gramas): para cada palabra, genera todos los prefijos desde 2 hasta 12 caracteres (ejemplo: "apartamento" $\rightarrow$ `["ap", "apa", "apar", "apart", "aparta", "apartam", "apartame", "apartamen", "apartament", "apartamento"]`).
+  5. Inclusión del `internalCode` completo en su forma normalizada.
+  6. Deduplicación mediante `Set` y limitación a un máximo de 300 tokens por documento.
+- **Por qué**: Permite coincidencias parciales por prefijo en tiempo real con `array-contains` en Firestore sin necesidad de integrar motores externos (como Algolia o Typesense), manteniendo el costo de infraestructura en cero.
+
+### Decisión 2: Inicialización de `assignedTo: null`
+- **Por qué**: Firestore no indexa campos ausentes (`undefined`) en índices compuestos. Escribir explícitamente `assignedTo: null` e `isAssigned: false` al crear inventarios asegura que los documentos aparezcan correctamente en las consultas compuestas de inventarios no asignados.
+
+### Decisión 3: Migración por Lotes y Paginada
+- **Estrategia**:
+  - Lectura en páginas de 50 documentos (`query(..., where("adminEmail", "==", email), orderBy("updatedAt"), startAfter(lastDoc), limit(50))`).
+  - Acumulación de escrituras en `writeBatch(db)` con commit cada 400 operaciones (respetando el límite estricto de 500 de Firestore con margen de seguridad).
+  - Manejo de reintentos individuales ante fallas temporales de red sin reiniciar desde cero.
+
+---
+
+## 4. Technical Architecture & Data Strategy
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│                        Dispositivo del Usuario                         │
-│                                                                        │
-│  [Captura Foto en Espacio o Anexo]                                     │
-│                │                                                       │
-│                ▼                                                       │
-│   Compresión JPEG + Generación Miniatura 320px (_thumb)                │
-│   Guardado en IndexedDB (status: 'pending', createdAt = timestamp)     │
-│                │                                                       │
-│                ▼                                                       │
-│   PhotoSyncEngine (Concurrencia = 3, Web Locks)                        │
-│       ├── 1. Storage: tenants/{adminUid}/photos/{userUid}/{photoId}.jpg│
-│       │               tenants/{adminUid}/photos/{userUid}/{photoId}_thumb.jpg
-│       │        (Refresh token ante 'storage/unauthorized')             │
-│       ├── 2. Firestore: setDoc(inventories/{id}/photos/{photoId})      │
-│       │        (con timestamp = record.createdAt original)             │
-│       └── 3. Liberación: deletePhotoRecord de IndexedDB                │
-└────────────────┬───────────────────────────────────────┬───────────────┘
-                 │                                       │
-                 ▼                                       ▼
-┌───────────────────────────────────┐ ┌──────────────────────────────────┐
-│         Firebase Storage          │ │        Cloud Firestore         │
-│ tenants/{adminUid}/photos/        │ │ inventories/{id}                 │
-│   {userUid}/{photoId}.jpg         │ │   (photoCount, spaces limpios)   │
-│   {userUid}/{photoId}_thumb.jpg   │ │   └── photos/{photoId}           │
-│                                   │ │         (un doc por foto)        │
-└───────────────────────────────────┘ └──────────────────────────────────┘
+│                          INVENTORY LIFECYCLE                           │
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
+    ┌───────────────────────────────┴───────────────────────────────┐
+    ▼                                                               ▼
+[Client Mutator Points]                                    [Server Mutator Points]
+ - saveInventory (draft / completed)                        - POST /api/remote-sign/confirm
+ - confirmFinalSave                                           (tenantReceiveSignature /
+ - handleSaveReception (owner / tenant)                        ownerDeliverySignature)
+ - handleAssignDependent / Unassign                                  │
+    │                                                                │
+    ▼                                                                ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                   CALCULATE DERIVED FIELDS (Atómica)                   │
+│  - isReceived = !!(tenantReceiveSignature || ownerDeliverySignature)   │
+│  - isAssigned = !!assignedTo                                           │
+│  - searchTokens = buildSearchTokens(inventory)                         │
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                   FIRESTORE PERSISTENCE & INDEXES                      │
+│  - Inventories Collection (/inventories/{id})                          │
+│  - Compound Indexes (adminEmail, status, isReceived, isAssigned...)    │
+│  - firestore.rules validation (searchTokens < 400, booleans)           │
+└────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                    ADMIN MIGRATION ENGINE (Profile)                    │
+│  - Query chunks of 50 (adminEmail == email, orderBy updatedAt)         │
+│  - writeBatch chunks (max 400)                                         │
+│  - Progress Tracker UI                                                 │
+│  - Set searchIndexVersion: 1 on user doc upon completion               │
+└────────────────────────────────────────────────────────────────────────┘
 ```
+
+### Componentes y Archivos Clave a Modificar
+
+1. **`src/types.ts`**:
+   - Agregar campos opcionales en `Inventory`:
+     ```ts
+     searchTokens?: string[];
+     isReceived?: boolean;
+     isAssigned?: boolean;
+     ```
+   - Agregar campo opcional en `User`:
+     ```ts
+     searchIndexVersion?: number;
+     ```
+
+2. **`src/lib/searchTokens.ts` (Nuevo Módulo Utilitario)**:
+   - Función pura `buildSearchTokens(inv: Partial<Inventory>): string[]`:
+     - Normalización (`normalize("NFD")`, regex `[^a-z0-9]`).
+     - Prefijos de 2 a 12 caracteres por palabra.
+     - Inclusión de `internalCode` normalizado.
+     - Límite de 300 tokens deduplicados.
+   - Función pura `computeDerivedInventoryFields(inv: Partial<Inventory>)`:
+     - Retorna `{ searchTokens, isReceived, isAssigned }`.
+
+3. **Puntos de Mantenimiento en `src/App.tsx`**:
+   - **`saveInventory`**: Al preparar `newDocData` y `updateDocData`, calcular e incluir `searchTokens`, `isReceived`, `isAssigned`. Al crear nuevo documento, asegurar `assignedTo: null` e `isAssigned: false`.
+   - **`confirmFinalSave`**: Asegurar que los datos pasados a `saveInventory` recalculen los campos derivados.
+   - **`handleSaveReception`**: Al guardar firmas de acta de inquilino o propietario presenciales, escribir `isReceived: true` y recalcular `searchTokens` si cambiaron nombres.
+   - **Asignación / Desasignación de Dependientes**:
+     - `handleAssignDependent`: escribir `assignedTo`, `assignedToName`, `assignedAt`, `assignedBy`, `isAssigned: true`.
+     - `handleUnassignDependent`: escribir `assignedTo: null`, `assignedToName: null`, `isAssigned: false`.
+   - **Creación de Borrador Inicial (`startNewInventory`)**: Inicializar con `assignedTo: null` e `isAssigned: false`.
+
+4. **Punto de Mantenimiento en `server.ts`**:
+   - En la ruta `/api/remote-sign/confirm`:
+     - Cuando `role === 'reception_owner'` o `role === 'reception_tenant'`, agregar a `updatePayload`:
+       - `isReceived: true`
+     - Recalcular `searchTokens` con `buildSearchTokens` si se actualizó `ownerName` o `tenantName`.
+
+5. **Herramienta de Migración en Perfil (`src/App.tsx`)**:
+   - Componente/sección en Ajustes (visible solo si `currentUser.role === 'admin'`).
+   - Función `runSearchOptimization()`:
+     - Consulta total de inventarios del tenant para la barra de progreso.
+     - Loop de paginación (`getDocs` con `startAfter(lastDoc)` en lotes de 50).
+     - Procesamiento con `writeBatch` (commit cada 400 documentos).
+     - Guardado de `updateDoc(doc(db, 'users', currentUser.id), { searchIndexVersion: 1, updatedAt: Date.now() })`.
+     - Aviso banner mientras `searchIndexVersion !== 1`.
+
+6. **Definición de Índices Compuestos (`firestore.indexes.json`)**:
+   - Crear archivo `firestore.indexes.json` con los 9 índices solicitados:
+     1. `[adminEmail ASC, status ASC, updatedAt DESC]`
+     2. `[adminEmail ASC, isReceived ASC, updatedAt DESC]`
+     3. `[adminEmail ASC, status ASC, isReceived ASC, isAssigned ASC, updatedAt DESC]`
+     4. `[adminEmail ASC, searchTokens ARRAY_CONTAINS, updatedAt DESC]`
+     5. `[adminEmail ASC, status ASC, searchTokens ARRAY_CONTAINS, updatedAt DESC]`
+     6. `[adminEmail ASC, internalCode ASC, updatedAt DESC]`
+     7. `[createdBy ASC, status ASC, updatedAt DESC]`
+     8. `[createdBy ASC, status ASC, completedAt DESC]`
+     9. `[assignedTo ASC, updatedAt DESC]`
+   - Configuración en `firebase.json` para referenciar `firestore.indexes.json`.
+   - Despliegue de índices en Firebase Firestore.
+
+7. **Reglas de Seguridad (`firestore.rules`)**:
+   - En `isValidInventory`:
+     ```cel
+     (!('searchTokens' in data) || data.searchTokens == null || (data.searchTokens is list && data.searchTokens.size() < 400)) &&
+     (!('isReceived' in data) || data.isReceived == null || data.isReceived is bool) &&
+     (!('isAssigned' in data) || data.isAssigned == null || data.isAssigned is bool) &&
+     ```
+   - En `isValidUser`:
+     ```cel
+     (!('searchIndexVersion' in data) || data.searchIndexVersion == null || (data.searchIndexVersion is number || data.searchIndexVersion is int)) &&
+     ```
+   - Despliegue de `firestore.rules` mediante la herramienta `deploy_firebase`.
 
 ---
 
-## 5. Plan de Ejecución por Archivos
+## Plan de Verificación y Pruebas
 
-1. **`firestore.rules`**:
-   - Reemplazar bloque de `match /inventories/{inventoryId}/photos/{photoId}` con las reglas exactas provistas.
-   - Actualizar `isValidInventory` para aceptar opcionalmente `photoCount`.
-   - Desplegar con `deploy_firebase`.
-
-2. **`src/types.ts`**:
-   - Añadir `thumbUrl?: string` a `Photo` y `OfflinePhotoRecord`.
-   - Declarar `InventoryPhotoDoc`.
-   - Añadir `photoCount?: number` a `Inventory` y `Annex`.
-
-3. **`src/photos.ts` (Reemplazo total)**:
-   - Crear utilidades limpias: `getPhotosOf`, `subscribePhotos`, `fetchPhotos`, `deleteAllPhotos` (lotes de 400), `stripPhotosForSave`.
-
-4. **`src/lib/photoSyncEngine.ts`**:
-   - Subida concurrente (límite 3 fotos en paralelo).
-   - Rutas en Storage: `tenants/{adminUid}/photos/{userUid}/{photoId}.jpg` y `_thumb.jpg`.
-   - Fallback si falta `thumbBlob`: generar en el momento o continuar sin miniatura.
-   - Fase 2 con `setDoc` en `inventories/{invId}/photos/{photoId}` con el timestamp original de captura.
-   - Reintentos con espera creciente (1, 2, 5, 15 min), re-autenticación en `storage/unauthorized`.
-
-5. **`src/components/PhotoThumb.tsx`**:
-   - Priorizar `photo.thumbUrl` para miniaturas y `photo.url` para fullscreen.
-   - Añadir `loading="lazy"` y `decoding="async"`.
-
-6. **`src/App.tsx`**:
-   - Integración de `getPhotosOf` en renderizado de espacios y anexos.
-   - Limpieza al guardar en `saveInventory` y `confirmFinalSave` (no re-incrustar fotos).
-   - Uso de `photoCount` en tarjetas y PDF.
-   - `onSnapshot` de `inventories/{id}/photos` solo mientras el inventario está abierto.
-   - Paginación de galerías con > 40 fotos.
-   - `downloadPhotosZip` obteniendo fotos de la subcolección + legacy.
-   - Eliminación en lotes de 400 con `deleteAllPhotos` en `handleDeleteInventory`.
-   - Banner global de fotos pendientes y aviso no bloqueante en firma.
-
-7. **Verificación**:
-   - `compile_applet`, `lint_applet` y `deploy_firebase`.
+1. **Pruebas Unitarias de `buildSearchTokens`**:
+   - Verificar remoción de tildes (ej. "habitación" $\rightarrow$ "habitacion", "cómodo" $\rightarrow$ "comodo").
+   - Verificar prefijos de 2 a 12 caracteres.
+   - Verificar deduplicación y truncamiento seguro a 300 elementos.
+2. **Pruebas de Flujos de Guardado y Mutación**:
+   - Creación de nuevo inventario: verificar `assignedTo: null`, `isAssigned: false`, `isReceived: false` y generación de `searchTokens`.
+   - Firma de acta de recepción presencial y remota: verificar `isReceived: true`.
+   - Asignación a dependiente: verificar `isAssigned: true` y `isAssigned: false` al desasignar.
+3. **Prueba de Migración por Lotes**:
+   - Simular ejecución con inventarios de la agencia, verificando progreso en UI y persistencia de `searchIndexVersion: 1`.
+4. **Compilación y Reglas**:
+   - Ejecutar `compile_applet` y `lint_applet` para verificar tipos y bundling.
+   - Desplegar reglas e índices en Firebase.
