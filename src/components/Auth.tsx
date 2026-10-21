@@ -10,7 +10,8 @@ import {
   signOut
 } from 'firebase/auth';
 import { doc, setDoc, getDoc, query, where, collection, getDocs, writeBatch, serverTimestamp } from 'firebase/firestore';
-import { UserRole } from '../types';
+import { UserRole, SUPER_ADMIN_EMAIL } from '../types';
+import { addMonths } from 'date-fns';
 
 export const Auth: React.FC = () => {
   const [isLogin, setIsLogin] = useState(true);
@@ -72,11 +73,11 @@ export const Auth: React.FC = () => {
           return;
         }
 
-        const isBootstrapAdmin = email.trim().toLowerCase() === 'djbtorreglosa@gmail.com';
+        const isBootstrapAdmin = email.trim().toLowerCase() === SUPER_ADMIN_EMAIL.toLowerCase();
         const cleanedLicenseCode = licenseCode.trim().toUpperCase();
 
         if (role === 'admin' && !isBootstrapAdmin && !cleanedLicenseCode) {
-          setError('Por favor ingresa un código de activación de licencia de 6 meses para registrarte como Administrador.');
+          setError('Por favor ingresa un código de activación de licencia para registrarte como Administrador.');
           setLoading(false);
           return;
         }
@@ -131,6 +132,7 @@ export const Auth: React.FC = () => {
 
         let licenseDocRef = null;
         let expirationDateIso = null;
+        let activatedDurationMonths = 6;
 
         if (role === 'admin') {
           if (!isBootstrapAdmin && cleanedLicenseCode) {
@@ -148,13 +150,15 @@ export const Auth: React.FC = () => {
                   setLoading(false);
                   return;
                 }
+                if (licenseData?.durationMonths) {
+                  activatedDurationMonths = Number(licenseData.durationMonths);
+                }
               }
             } catch (licErr) {
               console.warn('Licence check warning:', licErr);
             }
 
-            const expiration = new Date();
-            expiration.setDate(expiration.getDate() + 180); // 6 months (180 days)
+            const expiration = addMonths(new Date(), activatedDurationMonths);
             expirationDateIso = expiration.toISOString();
           } else {
             const expiration = new Date();
@@ -214,9 +218,9 @@ export const Auth: React.FC = () => {
         await batch.commit();
 
         if (isExistingAuthAccount) {
-          setSuccessMessage('¡Cuenta sincronizada y activada con éxito en la base de datos!');
+          setSuccessMessage(`¡Cuenta sincronizada y activada con éxito con licencia de ${activatedDurationMonths} meses!`);
         } else {
-          setSuccessMessage('¡Cuenta creada con éxito! Por favor verifica tu correo electrónico para continuar. Hemos enviado un enlace de confirmación.');
+          setSuccessMessage(`¡Cuenta creada con éxito con licencia de ${activatedDurationMonths} meses! Por favor verifica tu correo electrónico para continuar. Hemos enviado un enlace de confirmación.`);
           setIsLogin(true);
         }
       }
@@ -438,8 +442,8 @@ export const Auth: React.FC = () => {
                   >
                     <div className="space-y-2">
                       <label className="text-[10px] font-bold uppercase tracking-widest text-muted ml-1 flex items-center justify-between">
-                        <span>Código de Activación (Licencia 6 Meses)</span>
-                        {email.trim().toLowerCase() === 'djbtorreglosa@gmail.com' && (
+                        <span>Código de Activación (Licencia 3, 6 o 12 Meses)</span>
+                        {email.trim().toLowerCase() === SUPER_ADMIN_EMAIL.toLowerCase() && (
                           <span className="text-[10px] text-emerald-600 font-bold">Admin Principal (Exento)</span>
                         )}
                       </label>
@@ -447,7 +451,7 @@ export const Auth: React.FC = () => {
                         <Key className="absolute left-4 top-1/2 -translate-y-1/2 text-muted opacity-40" size={18} />
                         <input 
                           type="text"
-                          required={email.trim().toLowerCase() !== 'djbtorreglosa@gmail.com'}
+                          required={email.trim().toLowerCase() !== SUPER_ADMIN_EMAIL.toLowerCase()}
                           value={licenseCode}
                           onChange={(e) => setLicenseCode(e.target.value.toUpperCase())}
                           className="w-full bg-[#f8f9fa] border border-black/5 rounded-2xl pl-12 pr-4 py-4 focus:ring-2 focus:ring-black outline-none transition-all font-mono uppercase placeholder:normal-case"

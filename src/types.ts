@@ -1,3 +1,5 @@
+export const SUPER_ADMIN_EMAIL = 'djbtorreglosa@gmail.com';
+
 export type UserRole = 'admin' | 'dependent';
 
 export interface User {
@@ -7,6 +9,7 @@ export interface User {
   lastName: string;
   password?: string; // Only for local simulation
   role: UserRole;
+  phone?: string; // WhatsApp/Contact phone for agency notifications
   adminEmail?: string; // Required if role is 'dependent'
   adminUid?: string; // UID of the admin for dependents
   adminName?: string; // Name of the admin for dependents
@@ -27,6 +30,19 @@ export interface User {
   tenantTemplate?: string;
 }
 
+export interface LicenseEvent {
+  id?: string;
+  agencyId: string;
+  agencyEmail: string;
+  action: 'extend';
+  months: number;
+  reference?: string | null;
+  previousExpiration?: string | null;
+  newExpiration: string;
+  by: string;
+  at: number;
+}
+
 export interface License {
   id?: string;
   code: string;
@@ -44,6 +60,7 @@ export interface Photo {
   id: string;
   dataUrl?: string; // Legacy support; empty for new photos
   url?: string; // Firebase Storage download URL
+  thumbUrl?: string; // Firebase Storage thumbnail URL (~320px)
   storagePath?: string;
   localBlobId?: string; // Pointer to IndexedDB Blob record while offline
   syncStatus?: 'synced' | 'pending' | 'uploading' | 'failed';
@@ -51,14 +68,28 @@ export interface Photo {
   timestamp: number;
 }
 
+export interface InventoryPhotoDoc {
+  id: string;
+  spaceId?: string;
+  annexId?: string;
+  storagePath: string;
+  url: string;
+  thumbUrl?: string;
+  caption?: string;
+  timestamp: number;
+  createdBy: string;
+}
+
 export interface OfflinePhotoRecord {
   id: string;
   photoId?: string;
   inventoryId: string;
   spaceId?: string;
+  annexId?: string;
   isAnnex?: boolean;
   annexIndex?: number;
   blob: Blob;
+  thumbBlob?: Blob;
   storagePath: string;
   fileName?: string;
   contentType?: string;
@@ -76,6 +107,7 @@ export interface OfflinePhotoRecord {
   adminEmail?: string;
   storageUploaded?: boolean;
   downloadUrl?: string;
+  thumbUrl?: string;
   isDeleted?: boolean;
   caption?: string;
 }

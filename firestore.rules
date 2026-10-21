@@ -71,7 +71,8 @@ service cloud.firestore {
              (!('isDarkMode' in data) || data.isDarkMode is bool) &&
              (!('updatedAt' in data) || (data.updatedAt is number || data.updatedAt is int) || (data.updatedAt is string && data.updatedAt.size() < 100)) &&
              (!('ownerTemplate' in data) || (data.ownerTemplate is string && data.ownerTemplate.size() < 100000)) &&
-             (!('tenantTemplate' in data) || (data.tenantTemplate is string && data.tenantTemplate.size() < 100000));
+             (!('tenantTemplate' in data) || (data.tenantTemplate is string && data.tenantTemplate.size() < 100000)) &&
+             (!('phone' in data) || data.phone == null || (data.phone is string && data.phone.size() < 30));
     }
 
     function isValidLicense(data) {
@@ -141,6 +142,7 @@ service cloud.firestore {
              (!('assignedBy' in data) || data.assignedBy == null || (data.assignedBy is string && data.assignedBy.size() < 128)) &&
              (!('assignmentHistory' in data) || data.assignmentHistory == null || (data.assignmentHistory is list && data.assignmentHistory.size() < 200)) &&
              (!('photoMeta' in data) || data.photoMeta == null || data.photoMeta is map) &&
+             (!('photoCount' in data) || data.photoCount == null || (data.photoCount is number || data.photoCount is int)) &&
              (!('completedAt' in data) || data.completedAt == null || (data.completedAt is number || data.completedAt is int));
     }
 
@@ -260,6 +262,11 @@ service cloud.firestore {
       );
     }
 
+    match /licenseEvents/{eventId} {
+      allow read, create: if isAuthenticated() && isSuperAdmin();
+      allow update, delete: if false;
+    }
+
     match /inventories/{inventoryId} {
       // Zero public read: must be authenticated and belong to the agency tenant
       allow get: if isAuthenticated() && isUserActive() && (
@@ -341,32 +348,17 @@ service cloud.firestore {
       allow delete: if isAuthenticated() && isUserActive() && (isSuperAdmin() || resource.data.createdBy == request.auth.uid);
     }
 
-    // Fotos: un documento por foto (inventories/{id}/photos/{photoId})
+    // Fotos: un documento por foto en subcolección (inventories/{id}/photos/{photoId})
     match /inventories/{inventoryId}/photos/{photoId} {
-      function parentInv() {
-        return get(/databases/$(database)/documents/inventories/$(inventoryId)).data;
-      }
-      function canManagePhotos() {
-        return isAuthenticated() &&
-               (request.auth.uid == parentInv().createdBy ||
-                getUserData().email == parentInv().adminEmail);
-      }
-      function isValidPhoto(data) {
-        return data.dataUrl is string && data.dataUrl.size() < 950000 &&
-               data.timestamp is number &&
-               data.createdBy == request.auth.uid &&
-               (('spaceId' in data) != ('annexId' in data));
-      }
-
-      // Lectura pública si el inventario está firmado (enlace de descarga del PDF)
-      allow read: if parentInv().status == 'completed' || canManagePhotos();
-
-      // Inventario firmado: solo se pueden agregar fotos de anexos
-      allow create, update: if canManagePhotos() &&
-                            isValidPhoto(request.resource.data) &&
-                            (parentInv().status == 'draft' || 'annexId' in request.resource.data);
-
-      allow delete: if canManagePhotos();
+      function inv() { return get(/databases/$(database)/documents/inventories/$(inventoryId)).data; }
+      function agencyMember() { return isAuthenticated() && isUserActive() && (isSuperAdmin() || isUserInSameAgency(inv().get('adminEmail',''), inv().get('createdBy',''))); }
+      function validPhoto(d) { return d.createdBy == request.auth.uid && d.timestamp is number && d.url is string && d.storagePath is string && (('spaceId' in d) != ('annexId' in d)); }
+      allow read: if agencyMember();
+      allow create: if agencyMember() && validPhoto(request.resource.data) &&
+        (inv().get('status','draft') == 'draft' || ('annexId' in request.resource.data) ||
+         request.resource.data.timestamp <= inv().get('completedAt', 9007199254740991) + 300000);
+      allow update: if agencyMember() && inv().get('status','draft') == 'draft' && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['caption']);
+      allow delete: if agencyMember() && inv().get('status','draft') == 'draft';
     }
 
     match /test/connection {

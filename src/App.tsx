@@ -64,20 +64,22 @@ import {
   Smartphone,
   Link2,
   UserCheck,
-  Clock
+  Clock,
+  ShieldCheck
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { v4 as uuidv4 } from 'uuid';
-import { format } from 'date-fns';
+import { format, addMonths } from 'date-fns';
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import JSZip from 'jszip';
 import { saveAs } from 'file-saver';
-import { Inventory, InventorySpace, InventoryItem, Photo, User, Annex, InventoryTemplate, TemplateSpace, PropertyType, License, OfflinePhotoRecord } from './types';
+import { Inventory, InventorySpace, InventoryItem, Photo, User, Annex, InventoryTemplate, TemplateSpace, PropertyType, License, OfflinePhotoRecord, SUPER_ADMIN_EMAIL } from './types';
 import { SignaturePad } from './components/SignaturePad';
 import { Auth } from './components/Auth';
 import { PublicRemoteSignPage } from './components/PublicRemoteSignPage';
 import { PhotoThumb, getPhotoDisplayUrl } from './components/PhotoThumb';
+import { OwnerPanel } from './components/OwnerPanel';
 import { PhotoSyncEngine, photoSyncEngine } from './lib/photoSyncEngine';
 import { savePendingPhoto, deletePhotoRecord, markPhotoDeleted, getPhotoBlob } from './lib/offlinePhotoDb';
 import { auth, db, storage } from './firebase';
@@ -218,7 +220,7 @@ enum OperationType {
   WRITE = 'write',
 }
 
-type ViewType = 'list' | 'create' | 'detail' | 'dependents' | 'settings' | 'reception' | 'template-editor';
+type ViewType = 'list' | 'create' | 'detail' | 'dependents' | 'settings' | 'reception' | 'template-editor' | 'owner';
 
 /**
  * Recursively cleans undefined values while preserving valid falsy values (false, 0, "", null)
@@ -448,6 +450,7 @@ export default function App() {
   });
   const [editAgencyName, setEditAgencyName] = useState('');
   const [editAgencyLogo, setEditAgencyLogo] = useState('');
+  const [editAgencyPhone, setEditAgencyPhone] = useState('');
   const [isSavingPersonalization, setIsSavingPersonalization] = useState(false);
   const logoInputRef = useRef<HTMLInputElement>(null);
   const [ownerTemplate, setOwnerTemplate] = useState('');
@@ -462,12 +465,7 @@ export default function App() {
   const [showPhotosInDetail, setShowPhotosInDetail] = useState(false);
   const [expandedStatus, setExpandedStatus] = useState<string | null>(null);
   const [newLicenseCode, setNewLicenseCode] = useState('');
-  const [licensesList, setLicensesList] = useState<License[]>([]);
-  const [isGeneratingLicense, setIsGeneratingLicense] = useState(false);
-  const [licenseFilter, setLicenseFilter] = useState<'all' | 'available' | 'used'>('all');
-  const [licenseSearchQuery, setLicenseSearchQuery] = useState('');
   const [isActivatingCode, setIsActivatingCode] = useState(false);
-  const [copiedLicenseCode, setCopiedLicenseCode] = useState<string | null>(null);
   const [userTemplates, setUserTemplates] = useState<InventoryTemplate[]>([]);
   const [editingTemplate, setEditingTemplate] = useState<InventoryTemplate | null>(null);
   const [isSavingTemplate, setIsSavingTemplate] = useState(false);
@@ -528,40 +526,6 @@ export default function App() {
     window.history.pushState({ view: newView }, '');
   };
 
-  const generateNew6MonthLicense = async () => {
-    if (!currentUser || currentUser.email !== 'djbtorreglosa@gmail.com') {
-      showNotify('Solo el administrador principal puede generar códigos.', 'error');
-      return;
-    }
-    setIsGeneratingLicense(true);
-    try {
-      const rand1 = Math.random().toString(36).substring(2, 6).toUpperCase();
-      const rand2 = Math.random().toString(36).substring(2, 6).toUpperCase();
-      const generatedCode = `CHK-6M-${rand1}-${rand2}`;
-
-      const licenseDocRef = doc(db, 'licenses', generatedCode);
-      const newLicense: License = {
-        code: generatedCode,
-        isUsed: false,
-        durationMonths: 6,
-        createdAt: new Date().toISOString(),
-        createdBy: currentUser.email,
-        assignedTo: null,
-        assignedEmail: null,
-        activatedAt: null,
-        expiresAt: null
-      };
-
-      await setDoc(licenseDocRef, newLicense);
-      showNotify(`Código generado: ${generatedCode}`, 'success');
-    } catch (error) {
-      console.error('Error generating license:', error);
-      showNotify('Error al generar código de activación', 'error');
-    } finally {
-      setIsGeneratingLicense(false);
-    }
-  };
-
   const activateLicenseCode = async (codeToActivate: string) => {
     if (!currentUser) return;
     if (currentUser.role !== 'admin') {
@@ -591,11 +555,12 @@ export default function App() {
         return;
       }
 
-      // Calculate 6 months (180 days)
+      // Calculate calendar months (durationMonths or 6)
+      const durationMonths = Number(licenseData?.durationMonths) || 6;
       const now = new Date();
       const currentExp = currentUser.expirationDate ? new Date(currentUser.expirationDate) : now;
       const baseDate = currentExp > now ? currentExp : now;
-      const newExpiration = new Date(baseDate.getTime() + 180 * 24 * 60 * 60 * 1000);
+      const newExpiration = addMonths(baseDate, durationMonths);
       const newExpirationIso = newExpiration.toISOString();
 
       const batch = writeBatch(db);
@@ -627,7 +592,7 @@ export default function App() {
       }) : null);
 
       setNewLicenseCode('');
-      showNotify(`¡Licencia de 6 meses activada con éxito! Válida hasta ${format(newExpiration, 'dd/MM/yyyy')}`, 'success');
+      showNotify(`¡Licencia de ${durationMonths} meses activada con éxito! Válida hasta ${format(newExpiration, 'dd/MM/yyyy')}`, 'success');
     } catch (error) {
       console.error('Error activating license code:', error);
       showNotify('Error al activar el código de licencia', 'error');
@@ -642,7 +607,7 @@ export default function App() {
       navigateTo('settings');
       return;
     }
-    const isSuperAdmin = currentUser?.email === 'djbtorreglosa@gmail.com';
+    const isSuperAdmin = currentUser?.email === SUPER_ADMIN_EMAIL;
     if (currentUser?.role !== 'admin' || (!isSuperAdmin && dependent.adminEmail !== currentUser.email)) return;
     
     const newStatus = !dependent.isActive;
@@ -685,7 +650,7 @@ export default function App() {
       navigateTo('settings');
       return;
     }
-    const isSuperAdmin = currentUser?.email === 'djbtorreglosa@gmail.com';
+    const isSuperAdmin = currentUser?.email === SUPER_ADMIN_EMAIL;
     if (currentUser?.role !== 'admin' || (!isSuperAdmin && dependent.adminEmail !== currentUser.email)) return;
     
     setShowConfirm({
@@ -959,7 +924,7 @@ export default function App() {
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
       if (firebaseUser) {
         // If not verified, try one reload to see if they just verified in another tab
-        if (!firebaseUser.emailVerified && firebaseUser.email !== 'djbtorreglosa@gmail.com') {
+        if (!firebaseUser.emailVerified && firebaseUser.email !== SUPER_ADMIN_EMAIL) {
           try {
             await firebaseUser.reload();
           } catch (e) {
@@ -969,7 +934,7 @@ export default function App() {
 
         const updatedUser = auth.currentUser || firebaseUser;
         // Bypass verification for default admin
-        setIsEmailVerified(updatedUser.emailVerified || updatedUser.email === 'djbtorreglosa@gmail.com');
+        setIsEmailVerified(updatedUser.emailVerified || updatedUser.email === SUPER_ADMIN_EMAIL);
         
         let userDoc = await getDoc(doc(db, 'users', updatedUser.uid));
         
@@ -1059,6 +1024,7 @@ export default function App() {
             isDeleted: userData.isDeleted || false,
             agencyLogo: userData.role === 'admin' ? userData.agencyLogo : (adminAgencyLogo || userData.agencyLogo),
             agencyName: userData.role === 'admin' ? userData.agencyName : (adminAgencyName || userData.agencyName),
+            phone: userData.phone || undefined,
             isDarkMode: resolvedDarkMode,
             ownerTemplate: userData.role === 'admin' ? userData.ownerTemplate : adminOwnerTemplate,
             tenantTemplate: userData.role === 'admin' ? userData.tenantTemplate : adminTenantTemplate
@@ -1066,6 +1032,7 @@ export default function App() {
 
           setEditAgencyLogo(newUser.agencyLogo || '');
           setEditAgencyName(newUser.agencyName || '');
+          setEditAgencyPhone(newUser.phone || '');
 
           setCurrentUser(prev => {
             if (JSON.stringify(prev) === JSON.stringify(newUser)) return prev;
@@ -1083,7 +1050,7 @@ export default function App() {
           setTenantTemplate(finalTenantTemplate);
         } else {
           console.warn('User document NOT found in Firestore for UID:', updatedUser.uid, '- Auto-healing document in database...');
-          const isSuper = updatedUser.email === 'djbtorreglosa@gmail.com';
+          const isSuper = updatedUser.email === SUPER_ADMIN_EMAIL;
           const expiration = new Date();
           if (isSuper) {
             expiration.setFullYear(expiration.getFullYear() + 10);
@@ -1264,6 +1231,7 @@ export default function App() {
       setEditLastName(currentUser.lastName || '');
       setEditAgencyName(currentUser.agencyName || '');
       setEditAgencyLogo(currentUser.agencyLogo || '');
+      setEditAgencyPhone(currentUser.phone || '');
     }
   }, [view, currentUser]);
 
@@ -1363,6 +1331,7 @@ export default function App() {
       const updatePayload: any = {
         agencyName: editAgencyName.trim(),
         agencyLogo: logoToSave,
+        phone: editAgencyPhone.trim() || null,
         isDarkMode: isDarkMode,
         updatedAt: Date.now()
       };
@@ -1372,6 +1341,7 @@ export default function App() {
         ...prev,
         agencyName: editAgencyName.trim(),
         agencyLogo: logoToSave,
+        phone: editAgencyPhone.trim() || undefined,
         isDarkMode: isDarkMode
       } : null);
 
@@ -1512,31 +1482,6 @@ export default function App() {
     return unsubscribe;
   }, [currentUser?.id, isAuthReady]);
 
-  // Firestore Listener for Licenses (Super Admin only)
-  useEffect(() => {
-    if (!currentUser || currentUser.email !== 'djbtorreglosa@gmail.com' || !isAuthReady) {
-      setLicensesList([]);
-      return;
-    }
-
-    const q = query(
-      collection(db, 'licenses'),
-      orderBy('createdAt', 'desc'),
-      limit(100)
-    );
-
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const data = snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      })) as License[];
-      setLicensesList(data);
-    }, (error) => {
-      console.error('Error listening to licenses:', error);
-    });
-
-    return unsubscribe;
-  }, [currentUser?.email, isAuthReady]);
 
   const notificationTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -2014,7 +1959,7 @@ export default function App() {
     if (!currentUser) return false;
     
     // Super admin bypass
-    if (currentUser.email === 'djbtorreglosa@gmail.com') return true;
+    if (currentUser.email === SUPER_ADMIN_EMAIL) return true;
 
     // If admin, check their own 6-month license expirationDate
     if (currentUser.role === 'admin') {
@@ -2024,7 +1969,7 @@ export default function App() {
     
     // If dependent, check their admin's license expirationDate
     if (currentUser.role === 'dependent') {
-      if (currentUser.adminEmail === 'djbtorreglosa@gmail.com') return true;
+      if (currentUser.adminEmail === SUPER_ADMIN_EMAIL) return true;
       if (!currentUser.adminExpirationDate) return false;
       return new Date(currentUser.adminExpirationDate) >= new Date();
     }
@@ -4726,6 +4671,16 @@ export default function App() {
             >
               {isDarkMode ? <Sun size={17} className="text-amber-500" /> : <Moon size={17} className="text-neutral-700" />}
             </button>
+            {currentUser.email === SUPER_ADMIN_EMAIL && (
+              <button 
+                onClick={() => navigateTo('owner')}
+                className={`flex items-center gap-2 px-3 sm:px-4 py-2 rounded-xl transition-all text-xs font-bold ${view === 'owner' ? 'bg-purple-700 text-white shadow-sm' : 'bg-purple-50 hover:bg-purple-100 text-purple-900 border border-purple-200'}`}
+                title="Panel del propietario"
+              >
+                <ShieldCheck size={14} />
+                <span className="hidden sm:inline">Panel del propietario</span>
+              </button>
+            )}
             <button 
               onClick={() => navigateTo('settings')}
               className={`flex items-center gap-2 px-3 sm:px-4 py-2 rounded-xl transition-all text-xs font-bold ${view === 'settings' ? 'bg-black text-white' : 'bg-black/5 hover:bg-black/10 text-black'}`}
@@ -5753,6 +5708,20 @@ export default function App() {
                           </div>
 
                           <div className="space-y-2">
+                            <label className="text-[10px] font-bold uppercase tracking-widest text-muted ml-1 flex items-center justify-between">
+                              <span>WhatsApp de la agencia (para avisos de renovación)</span>
+                              <span className="text-[9px] text-muted normal-case font-normal">Opcional</span>
+                            </label>
+                            <input
+                              type="text"
+                              value={editAgencyPhone}
+                              onChange={(e) => setEditAgencyPhone(e.target.value)}
+                              placeholder="Ej: +57 300 123 4567"
+                              className="w-full bg-[#f8f9fa] border border-black/5 rounded-2xl px-4 py-3 focus:ring-2 focus:ring-black outline-none transition-all text-sm"
+                            />
+                          </div>
+
+                          <div className="space-y-2">
                             <label className="text-[10px] font-bold uppercase tracking-widest text-muted ml-1">
                               Imagen o Logo de la Agencia
                             </label>
@@ -5888,7 +5857,7 @@ export default function App() {
                       </div>
                       <div>
                         <h3 className="text-xl font-bold">Licencia de Uso</h3>
-                        <p className="text-xs text-muted">Gestión unificada de vigencia y activación (6 meses)</p>
+                        <p className="text-xs text-muted">Gestión de vigencia y activación</p>
                       </div>
                     </div>
 
@@ -5896,7 +5865,7 @@ export default function App() {
                     <div>
                       {currentUser.role === 'admin' ? (
                         (() => {
-                          if (currentUser.email === 'djbtorreglosa@gmail.com') {
+                          if (currentUser.email === SUPER_ADMIN_EMAIL) {
                             return (
                               <span className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-bold bg-purple-100 text-purple-800 border border-purple-200">
                                 <span className="w-2 h-2 rounded-full bg-purple-600 animate-pulse" />
@@ -5932,6 +5901,13 @@ export default function App() {
                     </div>
                   </div>
 
+                  {/* Privacy notice for administrators */}
+                  {currentUser.role === 'admin' && (
+                    <div className="p-3.5 bg-neutral-50 rounded-2xl border border-black/5 text-xs text-muted leading-relaxed">
+                      El propietario de la plataforma puede ver el estado de tu licencia, cuántos usuarios e inventarios tienes y tu última actividad, solo para soporte y renovaciones.
+                    </div>
+                  )}
+
                   {currentUser.role === 'admin' ? (
                     <div className="space-y-6">
                       {/* Summary Cards Grid */}
@@ -5939,16 +5915,18 @@ export default function App() {
                         <div className="p-5 bg-[#f8f9fa] rounded-2xl border border-black/5 space-y-1">
                           <p className="text-[10px] font-bold uppercase tracking-widest text-muted">Tipo de Plan</p>
                           <p className="text-base font-bold text-black">
-                            {currentUser.email === 'djbtorreglosa@gmail.com' ? 'Super Admin Maestro' : 'Licencia Semestral'}
+                            {currentUser.email === SUPER_ADMIN_EMAIL ? 'Super Admin Maestro' : 'Licencia CheckInventory'}
                           </p>
-                          <p className="text-xs text-muted">180 días de acceso total</p>
+                          <p className="text-xs text-muted">
+                            {currentUser.email === SUPER_ADMIN_EMAIL ? 'Acceso total de plataforma' : 'Acceso operativo activo'}
+                          </p>
                         </div>
 
                         <div className="p-5 bg-[#f8f9fa] rounded-2xl border border-black/5 space-y-1">
                           <p className="text-[10px] font-bold uppercase tracking-widest text-muted">Fecha de Vencimiento</p>
                           <p className="text-base font-bold text-black">
                             {(() => {
-                              if (currentUser.email === 'djbtorreglosa@gmail.com') return 'Permanente';
+                              if (currentUser.email === SUPER_ADMIN_EMAIL) return 'Permanente';
                               if (!currentUser.expirationDate) return 'Sin activar';
                               try {
                                 const date = new Date(currentUser.expirationDate);
@@ -5960,7 +5938,7 @@ export default function App() {
                           </p>
                           <p className="text-xs text-muted">
                             {(() => {
-                              if (currentUser.email === 'djbtorreglosa@gmail.com') return 'Sin caducidad';
+                              if (currentUser.email === SUPER_ADMIN_EMAIL) return 'Sin caducidad';
                               if (!currentUser.expirationDate) return 'Requiere código';
                               const date = new Date(currentUser.expirationDate);
                               return date >= new Date() ? 'En periodo activo' : 'Acceso caducado';
@@ -5972,7 +5950,7 @@ export default function App() {
                           <p className="text-[10px] font-bold uppercase tracking-widest text-muted">Código en Uso</p>
                           <div className="flex items-center justify-between">
                             <span className="text-sm font-mono font-bold text-black truncate max-w-[140px]">
-                              {currentUser.licenseCode || (currentUser.email === 'djbtorreglosa@gmail.com' ? 'MASTER-ACCOUNT' : 'Ninguno')}
+                              {currentUser.licenseCode || (currentUser.email === SUPER_ADMIN_EMAIL ? 'MASTER-ACCOUNT' : 'Ninguno')}
                             </span>
                             {currentUser.licenseCode && (
                               <button
@@ -5996,10 +5974,10 @@ export default function App() {
                         <div>
                           <h4 className="text-sm font-bold text-black flex items-center gap-2">
                             <Key size={15} className="text-amber-600" />
-                            <span>Activar o Renovar Licencia de 6 Meses</span>
+                            <span>Activar o Renovar Licencia</span>
                           </h4>
                           <p className="text-xs text-muted mt-1 leading-relaxed">
-                            Ingresa un código de 6 meses para activar tu cuenta o agregar 180 días adicionales a tu fecha de vencimiento actual.
+                            Ingresa un código de 3, 6 o 12 meses para activar tu cuenta o extender tu fecha de vencimiento actual.
                           </p>
                         </div>
 
@@ -6027,7 +6005,7 @@ export default function App() {
                         <div className="pt-2 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs border-t border-black/5">
                           <span className="text-muted text-[11px]">¿No tienes un código de activación o necesitas renovar?</span>
                           <a
-                            href="https://wa.me/573177694857?text=Hola,%20deseo%20adquirir%20un%20c%C3%B3digo%20de%20licencia%20temporal%20de%206%20meses%20para%20CheckIn%20App"
+                            href="https://wa.me/573177694857?text=Hola,%20deseo%20adquirir%20un%20c%C3%B3digo%20de%20licencia%20temporal%20para%20CheckIn%20App"
                             target="_blank"
                             rel="noopener noreferrer"
                             className="inline-flex items-center gap-2 text-emerald-700 bg-emerald-50 hover:bg-emerald-100 px-3.5 py-1.5 rounded-lg font-bold border border-emerald-200 transition-colors"
@@ -6037,129 +6015,6 @@ export default function App() {
                           </a>
                         </div>
                       </div>
-
-                      {/* Super Admin Unified Code Management Suite */}
-                      {currentUser.email === 'djbtorreglosa@gmail.com' && (
-                        <div className="pt-6 border-t border-black/10 space-y-5">
-                          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                            <div>
-                              <span className="text-[10px] font-bold uppercase tracking-widest text-purple-700 bg-purple-50 px-2 py-0.5 rounded border border-purple-200">
-                                Panel Maestro Super Admin
-                              </span>
-                              <h4 className="text-base font-bold mt-1">Generador y Control de Códigos Semestrales</h4>
-                            </div>
-                            <button
-                              onClick={generateNew6MonthLicense}
-                              disabled={isGeneratingLicense}
-                              className="px-4 py-2.5 bg-purple-700 hover:bg-purple-800 text-white rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 shadow-sm disabled:opacity-50 active:scale-95"
-                            >
-                              <Plus size={14} />
-                              <span>{isGeneratingLicense ? 'Generando...' : 'Generar Nuevo Código (6 Meses)'}</span>
-                            </button>
-                          </div>
-
-                          {/* Filters and Search */}
-                          <div className="flex flex-col sm:flex-row items-center justify-between gap-3">
-                            <div className="flex items-center gap-1.5 w-full sm:w-auto">
-                              <button
-                                onClick={() => setLicenseFilter('all')}
-                                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${licenseFilter === 'all' ? 'bg-black text-white' : 'bg-[#f8f9fa] text-muted hover:bg-black/5'}`}
-                              >
-                                Todos ({licensesList.length})
-                              </button>
-                              <button
-                                onClick={() => setLicenseFilter('available')}
-                                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${licenseFilter === 'available' ? 'bg-emerald-600 text-white' : 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100'}`}
-                              >
-                                Disponibles ({licensesList.filter(l => !l.isUsed).length})
-                              </button>
-                              <button
-                                onClick={() => setLicenseFilter('used')}
-                                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${licenseFilter === 'used' ? 'bg-amber-600 text-white' : 'bg-amber-50 text-amber-700 hover:bg-amber-100'}`}
-                              >
-                                Usados ({licensesList.filter(l => l.isUsed).length})
-                              </button>
-                            </div>
-
-                            <div className="relative w-full sm:w-64">
-                              <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-muted opacity-40" size={14} />
-                              <input
-                                type="text"
-                                value={licenseSearchQuery}
-                                onChange={(e) => setLicenseSearchQuery(e.target.value)}
-                                placeholder="Buscar código o email..."
-                                className="w-full pl-9 pr-3 py-1.5 bg-[#f8f9fa] border border-black/5 rounded-lg text-xs outline-none focus:ring-1 focus:ring-black"
-                              />
-                            </div>
-                          </div>
-
-                          {/* List of Codes */}
-                          <div className="space-y-2 max-h-80 overflow-y-auto pr-1">
-                            {(() => {
-                              const q = licenseSearchQuery.trim().toLowerCase();
-                              const filtered = licensesList.filter(l => {
-                                if (licenseFilter === 'available' && l.isUsed) return false;
-                                if (licenseFilter === 'used' && !l.isUsed) return false;
-                                if (q) {
-                                  const matchCode = l.code?.toLowerCase().includes(q);
-                                  const matchEmail = l.assignedEmail?.toLowerCase().includes(q);
-                                  return matchCode || matchEmail;
-                                }
-                                return true;
-                              });
-
-                              if (filtered.length === 0) {
-                                return (
-                                  <div className="p-8 text-center bg-[#f8f9fa] rounded-2xl border border-dashed border-black/10">
-                                    <p className="text-xs text-muted">No se encontraron códigos con los criterios seleccionados.</p>
-                                  </div>
-                                );
-                              }
-
-                              return filtered.map((lic) => (
-                                <div
-                                  key={lic.code}
-                                  className="p-3.5 bg-[#f8f9fa] hover:bg-[#f3f4f6] rounded-xl border border-black/5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 transition-colors"
-                                >
-                                  <div className="space-y-1">
-                                    <div className="flex items-center gap-2">
-                                      <span className="font-mono text-xs font-bold tracking-wider text-black">{lic.code}</span>
-                                      <span className={`px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider ${lic.isUsed ? 'bg-neutral-200 text-neutral-700' : 'bg-emerald-100 text-emerald-800'}`}>
-                                        {lic.isUsed ? 'Usado' : 'Disponible'}
-                                      </span>
-                                      <span className="text-[10px] text-muted bg-white px-2 py-0.5 rounded border border-black/5 font-medium">6 Meses</span>
-                                    </div>
-                                    <p className="text-[11px] text-muted">
-                                      {lic.isUsed && lic.assignedEmail ? (
-                                        <>Activado por: <span className="font-semibold text-black">{lic.assignedEmail}</span></>
-                                      ) : (
-                                        <>Creado: {lic.createdAt ? format(new Date(lic.createdAt), 'dd/MM/yyyy HH:mm') : 'N/A'}</>
-                                      )}
-                                      {lic.expiresAt && ` · Vence: ${format(new Date(lic.expiresAt), 'dd/MM/yyyy')}`}
-                                    </p>
-                                  </div>
-
-                                  <div className="flex items-center gap-2 shrink-0">
-                                    <button
-                                      onClick={() => {
-                                        navigator.clipboard.writeText(lic.code);
-                                        setCopiedLicenseCode(lic.code);
-                                        setTimeout(() => setCopiedLicenseCode(null), 2000);
-                                        showNotify('Código copiado al portapapeles');
-                                      }}
-                                      className="px-3 py-1.5 bg-white hover:bg-black hover:text-white text-black border border-black/10 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 shadow-sm active:scale-95"
-                                      title="Copiar Código"
-                                    >
-                                      <Copy size={12} />
-                                      <span>{copiedLicenseCode === lic.code ? '¡Copiado!' : 'Copiar'}</span>
-                                    </button>
-                                  </div>
-                                </div>
-                              ));
-                            })()}
-                          </div>
-                        </div>
-                      )}
                     </div>
                   ) : (
                     <div className="p-6 bg-[#f8f9fa] rounded-2xl border border-black/5 space-y-2">
@@ -6172,6 +6027,22 @@ export default function App() {
                   )}
                 </div>
               </div>
+            </motion.div>
+          )}
+
+          {view === 'owner' && currentUser && currentUser.email === SUPER_ADMIN_EMAIL && (
+            <motion.div
+              key="owner"
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -10 }}
+            >
+              <OwnerPanel
+                currentUser={currentUser}
+                isOnline={isOnline}
+                onBack={() => navigateTo('list')}
+                showNotify={showNotify}
+              />
             </motion.div>
           )}
 
@@ -7376,7 +7247,7 @@ export default function App() {
                           <p className="text-xs text-emerald-800 dark:text-emerald-200 leading-relaxed">
                             {remoteLinkStatusInfo?.status === 'test_redirected' ? (
                               <span>
-                                <strong>Modo de prueba Resend activo:</strong> La notificación fue enviada a su cuenta <strong>{remoteLinkStatusInfo.deliveredTo || 'djbtorreglosa@gmail.com'}</strong>. Puede compartir el enlace directamente al cliente por WhatsApp o copiarlo a continuación:
+                                <strong>Modo de prueba Resend activo:</strong> La notificación fue enviada a su cuenta <strong>{remoteLinkStatusInfo.deliveredTo || SUPER_ADMIN_EMAIL}</strong>. Puede compartir el enlace directamente al cliente por WhatsApp o copiarlo a continuación:
                               </span>
                             ) : remoteLinkStatusInfo?.status === 'warning' ? (
                               <span>El enlace de firma está <strong>activo y listo</strong> para ser completado por <strong>{receptionName || receptionEmail}</strong>. Puede compartirlo directamente por WhatsApp o copiar el enlace:</span>

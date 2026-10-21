@@ -1,0 +1,6 @@
+{
+  "summary":  "Plan de implementación revisado incorporando todas las precisiones del usuario: no re-incrustación de fotos en el documento principal, uso estricto de rutas autorizadas en storage.rules con soporte para _thumb, preservación estricta del timestamp original de captura, gestión de anexos con photoCount, migración de fotos pendientes existentes en IndexedDB, reemplazo completo de src/photos.ts y reglas exactas de Firestore.",
+  "updatedAt":  "2026-10-21T00:28:09.979633995Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

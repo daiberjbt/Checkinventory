@@ -4,15 +4,20 @@ import { getPhotoBlob, getPendingPhoto } from '../lib/offlinePhotoDb';
 import { photoSyncEngine } from '../lib/photoSyncEngine';
 import { Image as ImageIcon, Loader2, CloudUpload, AlertCircle } from 'lucide-react';
 
+/**
+ * Retorna la URL de alta resolución para visualización ampliada (modal / pantalla completa).
+ * Prioriza la imagen completa original (url) antes de la miniatura.
+ */
 export async function getPhotoDisplayUrl(photo: Photo): Promise<string> {
   if (photo.url) return photo.url;
   if (photo.dataUrl) return photo.dataUrl;
+  if (photo.thumbUrl) return photo.thumbUrl;
   if (photo.localBlobId) {
     try {
       const blob = await getPhotoBlob(photo.localBlobId);
       if (blob) return URL.createObjectURL(blob);
     } catch (e) {
-      console.warn('[PhotoThumb] Error fetching blob for display URL:', e);
+      console.warn('[PhotoThumb] Error obteniendo blob para display URL:', e);
     }
   }
   return '';
@@ -24,6 +29,7 @@ interface PhotoThumbProps {
   className?: string;
   onClick?: () => void;
   showSyncBadge?: boolean;
+  preferFullResolution?: boolean;
 }
 
 export const PhotoThumb: React.FC<PhotoThumbProps> = ({
@@ -31,11 +37,15 @@ export const PhotoThumb: React.FC<PhotoThumbProps> = ({
   alt = 'Foto',
   className = '',
   onClick,
-  showSyncBadge = true
+  showSyncBadge = true,
+  preferFullResolution = false
 }) => {
-  const [src, setSrc] = useState<string>(() => {
-    return photo.url || photo.dataUrl || '';
-  });
+  // En cuadrícula/lista preferir thumbUrl para carga rápida; si no existe, usar url o dataUrl
+  const initialSource = preferFullResolution
+    ? (photo.url || photo.thumbUrl || photo.dataUrl || '')
+    : (photo.thumbUrl || photo.url || photo.dataUrl || '');
+
+  const [src, setSrc] = useState<string>(initialSource);
   const [loading, setLoading] = useState<boolean>(!src);
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
   const [offlineRecord, setOfflineRecord] = useState<OfflinePhotoRecord | null>(null);
@@ -77,8 +87,13 @@ export const PhotoThumb: React.FC<PhotoThumbProps> = ({
   useEffect(() => {
     let isMounted = true;
 
-    if (photo.url) {
-      setSrc(photo.url);
+    // Priorizar thumbUrl si es thumbnail y está disponible
+    const chosenUrl = preferFullResolution
+      ? (photo.url || photo.thumbUrl)
+      : (photo.thumbUrl || photo.url);
+
+    if (chosenUrl) {
+      setSrc(chosenUrl);
       setLoading(false);
       return;
     }
@@ -102,7 +117,7 @@ export const PhotoThumb: React.FC<PhotoThumbProps> = ({
           setLoading(false);
         })
         .catch((err) => {
-          console.warn('[PhotoThumb] Could not load blob from IndexedDB:', err);
+          console.warn('[PhotoThumb] No se pudo leer blob de IndexedDB:', err);
           if (isMounted) setLoading(false);
         });
     } else {
@@ -115,7 +130,7 @@ export const PhotoThumb: React.FC<PhotoThumbProps> = ({
         URL.revokeObjectURL(objectUrl);
       }
     };
-  }, [photo.url, photo.dataUrl, photo.localBlobId]);
+  }, [photo.url, photo.thumbUrl, photo.dataUrl, photo.localBlobId, preferFullResolution]);
 
   const isFailed = offlineRecord?.status === 'failed';
   const isStalePending = Boolean(
@@ -142,6 +157,8 @@ export const PhotoThumb: React.FC<PhotoThumbProps> = ({
         <img
           src={src}
           alt={alt}
+          loading="lazy"
+          decoding="async"
           className="w-full h-full object-cover"
           referrerPolicy="no-referrer"
         />

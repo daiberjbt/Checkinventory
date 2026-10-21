@@ -1,138 +1,296 @@
 import {
-  collection, doc, setDoc, deleteDoc, getDocs, onSnapshot, writeBatch,
+  collection,
+  doc,
+  getDocs,
+  onSnapshot,
+  writeBatch
 } from 'firebase/firestore';
 import { db } from './firebase';
-import type { Inventory, Photo } from './types';
+import type { Inventory, InventorySpace, Annex, Photo, OfflinePhotoRecord, InventoryPhotoDoc } from './types';
+
+export const photosCollection = (inventoryId: string) =>
+  collection(db, 'inventories', inventoryId, 'photos');
 
 /**
- * Cada foto vive en su propio documento:  inventories/{id}/photos/{photoId}
- * (así no se supera el límite de 1 MB por documento y se pueden tener cientos de fotos).
- * El documento del inventario solo guarda texto + contadores.
+ * Consulta todas las fotografías sincronizadas en la subcolección del inventario.
  */
-export interface PhotoDoc {
-  id: string;
-  dataUrl: string;
-  timestamp: number;
-  spaceId?: string;
-  annexId?: string;
-  createdBy: string;
+export async function fetchPhotos(inventoryId: string): Promise<InventoryPhotoDoc[]> {
+  if (!inventoryId) return [];
+  const snap = await getDocs(photosCollection(inventoryId));
+  return snap.docs.map(d => ({ id: d.id, ...(d.data() as Omit<InventoryPhotoDoc, 'id'>) }));
 }
-export type PhotoTarget = { spaceId: string } | { annexId: string };
-
-const photosCol = (inventoryId: string) => collection(db, 'inventories', inventoryId, 'photos');
 
 /**
- * Firestore con caché offline NO resuelve la promesa de una escritura hasta que
- * el servidor la confirma (sin internet, nunca). La escritura local ya quedó hecha,
- * así que esperamos poco y seguimos; los errores tardíos solo se registran.
+ * Escucha en tiempo real la subcolección de fotos de un inventario abierto.
  */
-export function queued<T>(p: Promise<T>, ms = 1500): Promise<T | undefined> {
-  p.catch((e) => console.error('Firestore write failed', e));
-  return new Promise((resolve, reject) => {
-    const t = setTimeout(() => resolve(undefined), ms);
-    p.then(
-      (v) => { clearTimeout(t); resolve(v); },
-      (e) => { clearTimeout(t); reject(e); }
-    );
-  });
-}
-
-export function persistPhoto(inventoryId: string, photo: Photo, target: PhotoTarget, userId: string) {
-  return setDoc(doc(photosCol(inventoryId), photo.id), {
-    dataUrl: photo.dataUrl,
-    timestamp: photo.timestamp,
-    createdBy: userId,
-    ...target,
-  });
-}
-
-export const removePhotoDoc = (inventoryId: string, photoId: string) =>
-  deleteDoc(doc(photosCol(inventoryId), photoId));
-
-/** Firestore no borra subcolecciones solo: hay que borrar las fotos antes del inventario. */
-export async function deleteAllPhotos(inventoryId: string) {
-  const snap = await getDocs(photosCol(inventoryId));
-  const refs = snap.docs.map((d) => d.ref);
-  for (let i = 0; i < refs.length; i += 400) {
-    const batch = writeBatch(db);
-    refs.slice(i, i + 400).forEach((r) => batch.delete(r));
-    await queued(batch.commit(), 4000);
-  }
-}
-
-const toDoc = (d: any): PhotoDoc => ({ id: d.id, ...(d.data() as Omit<PhotoDoc, 'id'>) });
-
-export async function fetchPhotos(inventoryId: string): Promise<PhotoDoc[]> {
-  const snap = await getDocs(photosCol(inventoryId));
-  return snap.docs.map(toDoc);
-}
-
-/** Escucha las fotos de un inventario. Solo notifica cuando algo cambió de verdad. */
 export function subscribePhotos(
   inventoryId: string,
-  cb: (docs: PhotoDoc[], fromCache: boolean) => void,
-  onError: (e: unknown) => void
-) {
-  let first = true;
-  let lastFromCache: boolean | null = null;
+  onUpdate: (photos: InventoryPhotoDoc[]) => void,
+  onError?: (error: any) => void
+): () => void {
+  if (!inventoryId) return () => {};
   return onSnapshot(
-    photosCol(inventoryId),
-    { includeMetadataChanges: true },
+    photosCollection(inventoryId),
     (snap) => {
-      const changed = first || snap.docChanges().length > 0 || snap.metadata.fromCache !== lastFromCache;
-      first = false;
-      lastFromCache = snap.metadata.fromCache;
-      if (changed) cb(snap.docs.map(toDoc), snap.metadata.fromCache);
+      const photos = snap.docs.map(d => ({
+        id: d.id,
+        ...(d.data() as Omit<InventoryPhotoDoc, 'id'>)
+      }));
+      onUpdate(photos);
     },
-    onError
+    (err) => {
+      console.warn(`[Photos] Error en onSnapshot de fotos para ${inventoryId}:`, err);
+      if (onError) onError(err);
+    }
   );
 }
 
-const toPhoto = (d: PhotoDoc): Photo => ({ id: d.id, dataUrl: d.dataUrl, timestamp: d.timestamp });
-const byTime = (a: Photo, b: Photo) => a.timestamp - b.timestamp;
+/**
+ * Elimina todas las fotos de la subcolección en lotes de 400 documentos antes de borrar el inventario.
+ */
+export async function deleteAllPhotos(inventoryId: string): Promise<void> {
+  if (!inventoryId) return;
+  const snap = await getDocs(photosCollection(inventoryId));
+  const refs = snap.docs.map(d => d.ref);
+  for (let i = 0; i < refs.length; i += 400) {
+    const batch = writeBatch(db);
+    const chunk = refs.slice(i, i + 400);
+    chunk.forEach(ref => batch.delete(ref));
+    await batch.commit();
+  }
+}
 
 /**
- * Reparte las fotos de la subcolección dentro de espacios/anexos.
- * - Conserva las fotos en memoria que aún no se han guardado (p. ej. fotos antiguas
- *   que venían dentro del documento y todavía no se migran).
- * - Quita las que ya estaban guardadas y ya no existen (borradas desde otro equipo).
+ * COMPATIBILIDAD: Combina fotos antiguas embebidas en el documento + fotos sincronizadas
+ * de la subcolección + fotos locales pendientes de IndexedDB sin duplicados por ID.
+ * Si el ID existe en la subcolección, gana la foto sincronizada.
  */
-export function applyPhotoSnapshot(inv: Inventory, docs: PhotoDoc[], persisted: Set<string>): Inventory {
-  docs.forEach((d) => persisted.add(d.id));
-  const place = (existing: Photo[] | undefined, match: (d: PhotoDoc) => boolean): Photo[] => {
-    const fromDocs = docs.filter(match).map(toPhoto);
-    const inDocs = new Set(fromDocs.map((p) => p.id));
-    const keep = (existing || []).filter((p) => !inDocs.has(p.id) && !persisted.has(p.id));
-    return [...fromDocs, ...keep].sort(byTime);
-  };
+export function getPhotosOf(
+  container: InventorySpace | Annex,
+  subcollectionPhotos: InventoryPhotoDoc[] = [],
+  pendingLocalPhotos: OfflinePhotoRecord[] = []
+): Photo[] {
+  if (!container) return [];
+
+  const isAnnex = 'text' in container;
+  const containerId = container.id;
+
+  // 1. Fotos antiguas embebidas en el documento
+  const rawLegacyPhotos: Photo[] = Array.isArray(container.photos) ? container.photos : [];
+
+  // 2. Fotos de la subcolección para este espacio o anexo
+  const matchedSubDocs = subcollectionPhotos.filter(doc => {
+    if (isAnnex) {
+      return doc.annexId === containerId;
+    }
+    return doc.spaceId === containerId;
+  });
+
+  // 3. Fotos locales pendientes en IndexedDB
+  const matchedPendingRecords = pendingLocalPhotos.filter(rec => {
+    if (rec.isDeleted) return false;
+    if (isAnnex) {
+      return rec.annexId === containerId || (rec.isAnnex && rec.spaceId === containerId);
+    }
+    return !rec.isAnnex && rec.spaceId === containerId;
+  });
+
+  const photoMap = new Map<string, Photo>();
+
+  // Primer paso: Fotos antiguas
+  for (const legacy of rawLegacyPhotos) {
+    if (!legacy || !legacy.id) continue;
+    photoMap.set(legacy.id, {
+      ...legacy,
+      syncStatus: legacy.syncStatus || 'synced'
+    });
+  }
+
+  // Segundo paso: Fotos locales pendientes (reemplazan o agregan)
+  for (const pending of matchedPendingRecords) {
+    const pendingPhoto: Photo = {
+      id: pending.id,
+      url: pending.downloadUrl || '',
+      thumbUrl: pending.thumbUrl || '',
+      storagePath: pending.storagePath,
+      localBlobId: pending.id,
+      syncStatus: pending.status === 'synced' ? 'synced' : (pending.status || 'pending'),
+      caption: pending.caption || '',
+      timestamp: pending.createdAt
+    };
+    photoMap.set(pending.id, pendingPhoto);
+  }
+
+  // Tercer paso: Subcolección (GANA SIEMPRE la foto sincronizada en caso de coincidencia)
+  for (const doc of matchedSubDocs) {
+    photoMap.set(doc.id, {
+      id: doc.id,
+      url: doc.url,
+      thumbUrl: doc.thumbUrl,
+      storagePath: doc.storagePath,
+      syncStatus: 'synced',
+      caption: doc.caption || '',
+      timestamp: doc.timestamp
+    });
+  }
+
+  return Array.from(photoMap.values()).sort((a, b) => a.timestamp - b.timestamp);
+}
+
+/**
+ * Sanitiza y prepara el documento de inventario para guardarlo en Firestore sin re-incrustar fotos.
+ * Conserva ÚNICAMENTE las fotos históricas que ya venían embebidas originalmente en el documento.
+ * NUNCA incluye fotos provenientes de la subcolección ni marcadores locales (localBlobId, syncStatus pending/uploading).
+ */
+export function stripPhotosForSave(
+  inventory: Inventory,
+  originalInventory?: Inventory | null,
+  totalPhotoCount?: number
+): { spaces: InventorySpace[]; annexes?: Annex[]; photoCount: number } {
+  // Construir mapa de IDs de fotos que ya estaban originalmente embebidas en el documento remoto
+  const legacyPhotoIds = new Set<string>();
+  if (originalInventory) {
+    if (Array.isArray(originalInventory.spaces)) {
+      originalInventory.spaces.forEach(s => {
+        if (Array.isArray(s.photos)) {
+          s.photos.forEach(p => {
+            if (p && p.id && !p.localBlobId && (p.url || p.dataUrl)) {
+              legacyPhotoIds.add(p.id);
+            }
+          });
+        }
+      });
+    }
+    if (Array.isArray(originalInventory.annexes)) {
+      originalInventory.annexes.forEach(a => {
+        if (Array.isArray(a.photos)) {
+          a.photos.forEach(p => {
+            if (p && p.id && !p.localBlobId && (p.url || p.dataUrl)) {
+              legacyPhotoIds.add(p.id);
+            }
+          });
+        }
+      });
+    }
+  }
+
+  // Limpiar spaces
+  const cleanSpaces: InventorySpace[] = (inventory.spaces || []).map(space => {
+    const rawPhotos = Array.isArray(space.photos) ? space.photos : [];
+    const keptPhotos = rawPhotos.filter(p => {
+      if (!p || !p.id) return false;
+      // NUNCA guardar fotos locales o pendientes en el documento
+      if (p.localBlobId) return false;
+      if (p.syncStatus && p.syncStatus !== 'synced') return false;
+      // Si tenemos registro del documento original, solo conservar si ya estaba embebida
+      if (originalInventory) {
+        return legacyPhotoIds.has(p.id);
+      }
+      // Si no tenemos documento original (ej. primer guardado), no embebemos fotos
+      return false;
+    });
+
+    return {
+      ...space,
+      photos: keptPhotos
+    };
+  });
+
+  // Limpiar annexes
+  let cleanAnnexes: Annex[] | undefined = undefined;
+  if (Array.isArray(inventory.annexes)) {
+    cleanAnnexes = inventory.annexes.map(annex => {
+      const rawPhotos = Array.isArray(annex.photos) ? annex.photos : [];
+      const keptPhotos = rawPhotos.filter(p => {
+        if (!p || !p.id) return false;
+        if (p.localBlobId) return false;
+        if (p.syncStatus && p.syncStatus !== 'synced') return false;
+        if (originalInventory) {
+          return legacyPhotoIds.has(p.id);
+        }
+        return false;
+      });
+
+      return {
+        ...annex,
+        photos: keptPhotos,
+        photoCount: typeof annex.photoCount === 'number' ? annex.photoCount : rawPhotos.length
+      };
+    });
+  }
+
+  const computedPhotoCount = typeof totalPhotoCount === 'number'
+    ? totalPhotoCount
+    : (typeof inventory.photoCount === 'number' ? inventory.photoCount : 0);
+
   return {
-    ...inv,
-    spaces: inv.spaces.map((s) => ({ ...s, photos: place(s.photos, (d) => d.spaceId === s.id) })),
-    ...(inv.annexes
-      ? { annexes: inv.annexes.map((a) => ({ ...a, photos: place(a.photos, (d) => d.annexId === a.id) })) }
-      : {}),
+    spaces: cleanSpaces,
+    ...(cleanAnnexes ? { annexes: cleanAnnexes } : {}),
+    photoCount: computedPhotoCount
   };
 }
 
-/** Versión liviana para guardar en el documento del inventario (sin imágenes). */
-export function stripPhotos(
-  inv: Inventory,
-  opts: { photoCount: number; keepEmbedded?: Set<string> }
-): Inventory {
-  const keep = opts.keepEmbedded ?? new Set<string>();
-  const out: Inventory = {
-    ...inv,
-    photoCount: opts.photoCount,
-    spaces: inv.spaces.map((s) => ({ ...s, photos: (s.photos || []).filter((p) => keep.has(p.id)) })),
-  };
-  if (inv.annexes) {
-    out.annexes = inv.annexes.map((a) => ({
-      ...a,
-      photoCount: Math.max(a.photos?.length ?? 0, a.photoCount ?? 0),
-      photos: (a.photos || []).filter((p) => keep.has(p.id)),
-    }));
-  } else {
-    delete out.annexes; // Firestore rechaza valores undefined
-  }
-  return out;
+/**
+ * Genera una miniatura JPEG de ~320 px (calidad 0.7) en canvas a partir de un Blob de imagen.
+ */
+export async function createThumbnailBlob(blob: Blob, maxDim = 320, quality = 0.7): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    if (typeof window === 'undefined') {
+      return reject(new Error('Window no disponible para canvas'));
+    }
+
+    const img = new Image();
+    const url = URL.createObjectURL(blob);
+
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      try {
+        let width = img.width;
+        let height = img.height;
+
+        if (width > height) {
+          if (width > maxDim) {
+            height = Math.round((height * maxDim) / width);
+            width = maxDim;
+          }
+        } else {
+          if (height > maxDim) {
+            width = Math.round((width * maxDim) / height);
+            height = maxDim;
+          }
+        }
+
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(width, 1);
+        canvas.height = Math.max(height, 1);
+
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          return reject(new Error('No se pudo obtener el contexto 2D del canvas'));
+        }
+
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        canvas.toBlob(
+          (thumbBlob) => {
+            if (thumbBlob) {
+              resolve(thumbBlob);
+            } else {
+              reject(new Error('toBlob retornó null'));
+            }
+          },
+          'image/jpeg',
+          quality
+        );
+      } catch (err) {
+        reject(err);
+      }
+    };
+
+    img.onerror = (e) => {
+      URL.revokeObjectURL(url);
+      reject(new Error('Error al cargar imagen en objeto Image para miniatura'));
+    };
+
+    img.src = url;
+  });
 }
