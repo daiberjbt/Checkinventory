@@ -25,6 +25,7 @@
         "isDeleted": { "type": "boolean", "description": "Whether the user account is soft-deleted" },
         "ownerTemplate": { "type": "string" },
         "tenantTemplate": { "type": "string" },
+        "searchIndexVersion": { "type": "number", "description": "Search index version for migration tracking" },
         "id": { "type": "string" },
         "updatedAt": { "type": "number" },
         "createdAt": { "type": "string" }
@@ -92,7 +93,10 @@
         "assignedToName": { "type": "string", "description": "Name of the assigned dependent" },
         "assignedAt": { "type": "number", "description": "Timestamp when assigned" },
         "assignedBy": { "type": "string", "description": "UID of the admin who assigned" },
-        "assignmentHistory": { "type": "array", "description": "Audit history of assignments" }
+        "assignmentHistory": { "type": "array", "description": "Audit history of assignments" },
+        "searchTokens": { "type": "array", "description": "Normalized prefix search tokens for server search" },
+        "isReceived": { "type": "boolean", "description": "Whether reception or delivery act signature exists" },
+        "isAssigned": { "type": "boolean", "description": "Whether the inventory is assigned to a dependent" }
       },
       "required": ["propertyName", "address", "date", "status", "createdBy", "adminEmail", "createdAt", "spaces"]
     },

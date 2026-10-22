@@ -67,7 +67,9 @@ import {
   Clock,
   ShieldCheck,
   CloudUpload,
-  RefreshCw
+  RefreshCw,
+  Sparkles,
+  AlertCircle
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { v4 as uuidv4 } from 'uuid';
@@ -118,8 +120,10 @@ import {
   setDoc,
   writeBatch,
   getDocFromServer,
-  arrayUnion
+  arrayUnion,
+  startAfter
 } from 'firebase/firestore';
+import { buildSearchTokens, computeIsReceived, computeIsAssigned } from './lib/searchTokens';
 import { ref, uploadBytesResumable, getDownloadURL, deleteObject } from 'firebase/storage';
 import ReactQuill from 'react-quill-new';
 import 'react-quill-new/dist/quill.snow.css';
@@ -503,6 +507,16 @@ export default function App() {
   const [showTemplateSelector, setShowTemplateSelector] = useState(false);
   const [showSpaceSelector, setShowSpaceSelector] = useState(false);
   const [showUserTemplates, setShowUserTemplates] = useState(false);
+
+  // Search Optimization Migration
+  const [isOptimizingSearch, setIsOptimizingSearch] = useState(false);
+  const [showOptimizeModal, setShowOptimizeModal] = useState(false);
+  const [optimizeProgress, setOptimizeProgress] = useState<{
+    processed: number;
+    failed: { id: string; internalCode: string; error: string }[];
+    statusText: string;
+    isFinished: boolean;
+  } | null>(null);
 
   // Mobile / Android Optimizations
   const [isOnline, setIsOnline] = useState<boolean>(navigator.onLine);
@@ -1134,7 +1148,8 @@ export default function App() {
             phone: userData.phone || undefined,
             isDarkMode: resolvedDarkMode,
             ownerTemplate: userData.role === 'admin' ? userData.ownerTemplate : adminOwnerTemplate,
-            tenantTemplate: userData.role === 'admin' ? userData.tenantTemplate : adminTenantTemplate
+            tenantTemplate: userData.role === 'admin' ? userData.tenantTemplate : adminTenantTemplate,
+            searchIndexVersion: userData.searchIndexVersion
           } as User;
 
           setEditAgencyLogo(newUser.agencyLogo || '');
@@ -1888,6 +1903,7 @@ export default function App() {
         assignedAt: _assignedAt,
         assignedBy: _assignedBy,
         assignmentHistory: _assignmentHistory,
+        isAssigned: _isAssigned,
         ...data 
       } = cleanInventory;
       
@@ -1932,6 +1948,10 @@ export default function App() {
           createdBy: currentUser.id,
           creatorName: `${currentUser.firstName || ''} ${currentUser.lastName || ''}`.trim() || currentUser.email || 'Usuario',
           adminEmail: effectiveAdminEmail,
+          assignedTo: null,
+          isAssigned: false,
+          isReceived: computeIsReceived(data),
+          searchTokens: buildSearchTokens(data),
           createdAt: typeof data.createdAt === 'number' ? data.createdAt : Date.now(),
           updatedAt: Date.now()
         });
@@ -1963,6 +1983,15 @@ export default function App() {
           if (data.ownerDeliverySignature && !existingData.ownerDeliverySignature) {
             safeUpdate.ownerDeliverySignature = data.ownerDeliverySignature;
           }
+          if (data.ownerEmail) safeUpdate.ownerEmail = data.ownerEmail;
+          if (data.tenantEmail) safeUpdate.tenantEmail = data.tenantEmail;
+          if (data.ownerName) safeUpdate.ownerName = data.ownerName;
+          if (data.tenantName) safeUpdate.tenantName = data.tenantName;
+
+          // Always recalculate isReceived and searchTokens
+          const mergedForDerivatives = { ...existingData, ...safeUpdate };
+          safeUpdate.isReceived = computeIsReceived(mergedForDerivatives);
+          safeUpdate.searchTokens = buildSearchTokens(mergedForDerivatives);
           
           await updateDoc(inventoryRef, sanitizeData(safeUpdate));
           PhotoSyncEngine.getInstance().markInventoryPersisted(inventoryId);
@@ -1977,15 +2006,25 @@ export default function App() {
         // Prepare update data, preserving immutable identifiers exactly as stored
         const { createdBy, adminEmail, createdAt, ...updateData } = data;
         
+        const mergedForDerivatives = { ...existingData, ...updateData };
+        const calculatedSearchTokens = buildSearchTokens(mergedForDerivatives);
+        const calculatedIsReceived = computeIsReceived(mergedForDerivatives);
+
         const updateDocData = sanitizeInventory({
           ...updateData,
           id: inventoryId,
+          searchTokens: calculatedSearchTokens,
+          isReceived: calculatedIsReceived,
           createdBy: existingData?.createdBy || currentUser.id,
           creatorName: existingData?.creatorName || data.creatorName || `${currentUser.firstName || ''} ${currentUser.lastName || ''}`.trim() || currentUser.email || 'Usuario',
           adminEmail: existingData?.adminEmail || effectiveAdminEmail,
           createdAt: typeof existingData?.createdAt === 'number' ? existingData.createdAt : (typeof createdAt === 'number' ? createdAt : Date.now()),
           updatedAt: Date.now()
         });
+
+        // Ensure isAssigned and assignedTo are never altered by saveInventory
+        delete (updateDocData as any).isAssigned;
+        delete (updateDocData as any).assignedTo;
 
         await setDoc(inventoryRef, updateDocData, { merge: true });
       }
@@ -2144,6 +2183,10 @@ export default function App() {
       createdBy: currentUser?.id || '',
       creatorName: `${currentUser?.firstName || ''} ${currentUser?.lastName || ''}`.trim() || currentUser?.email || 'Usuario',
       adminEmail: effectiveAdminEmail,
+      assignedTo: null,
+      isAssigned: false,
+      isReceived: false,
+      searchTokens: [],
       spaces: PROPERTY_TEMPLATES['Apartamento'].map(s => ({
         id: uuidv4(),
         title: s.title,
@@ -2501,6 +2544,160 @@ export default function App() {
     }
   }, [view, isConsultationMode]);
 
+  const handleOptimizeSearch = async () => {
+    if (!currentUser || currentUser.role !== 'admin' || !currentUser.email) {
+      showNotify('Solo los administradores pueden optimizar la búsqueda', 'error');
+      return;
+    }
+
+    setIsOptimizingSearch(true);
+    setShowOptimizeModal(true);
+    setOptimizeProgress({
+      processed: 0,
+      failed: [],
+      statusText: 'Iniciando optimización de base de datos...',
+      isFinished: false
+    });
+
+    const failedItems: { id: string; internalCode: string; error: string }[] = [];
+    let totalProcessed = 0;
+    let lastDocSnap: any = null;
+    let hasMore = true;
+
+    try {
+      while (hasMore) {
+        setOptimizeProgress(prev => ({
+          processed: totalProcessed,
+          failed: failedItems,
+          statusText: `Consultando página de inventarios (${totalProcessed} procesados)...`,
+          isFinished: false
+        }));
+
+        const q = lastDocSnap
+          ? query(
+              collection(db, 'inventories'),
+              where('adminEmail', '==', currentUser.email),
+              orderBy('updatedAt'),
+              startAfter(lastDocSnap),
+              limit(50)
+            )
+          : query(
+              collection(db, 'inventories'),
+              where('adminEmail', '==', currentUser.email),
+              orderBy('updatedAt'),
+              limit(50)
+            );
+
+        const snapshot = await getDocs(q);
+
+        if (snapshot.empty) {
+          hasMore = false;
+          break;
+        }
+
+        const docsInBatch = snapshot.docs;
+        const batch = writeBatch(db);
+
+        for (const docSnap of docsInBatch) {
+          const invData = docSnap.data() as Inventory;
+          const searchTokens = buildSearchTokens(invData);
+          const isReceived = computeIsReceived(invData);
+          const isAssigned = computeIsAssigned(invData);
+
+          const updateFields: any = {
+            searchTokens,
+            isReceived,
+            isAssigned
+          };
+          if (invData.assignedTo === undefined) {
+            updateFields.assignedTo = null;
+          }
+
+          batch.update(doc(db, 'inventories', docSnap.id), updateFields);
+        }
+
+        try {
+          await batch.commit();
+          totalProcessed += docsInBatch.length;
+        } catch (batchErr: any) {
+          console.warn('Batch commit falló durante optimización, reintentando uno a uno:', batchErr);
+          for (const docSnap of docsInBatch) {
+            const invData = docSnap.data() as Inventory;
+            const searchTokens = buildSearchTokens(invData);
+            const isReceived = computeIsReceived(invData);
+            const isAssigned = computeIsAssigned(invData);
+
+            const updateFields: any = {
+              searchTokens,
+              isReceived,
+              isAssigned
+            };
+            if (invData.assignedTo === undefined) {
+              updateFields.assignedTo = null;
+            }
+
+            try {
+              await updateDoc(doc(db, 'inventories', docSnap.id), updateFields);
+              totalProcessed++;
+            } catch (singleErr: any) {
+              console.error(`Error optimizando inventario ${docSnap.id}:`, singleErr);
+              failedItems.push({
+                id: docSnap.id,
+                internalCode: invData.internalCode || invData.propertyName || docSnap.id,
+                error: singleErr?.message || 'Error desconocido'
+              });
+            }
+          }
+        }
+
+        setOptimizeProgress({
+          processed: totalProcessed,
+          failed: [...failedItems],
+          statusText: `Procesados ${totalProcessed} inventarios...`,
+          isFinished: false
+        });
+
+        lastDocSnap = docsInBatch[docsInBatch.length - 1];
+        if (docsInBatch.length < 50) {
+          hasMore = false;
+        }
+      }
+
+      if (failedItems.length === 0) {
+        await updateDoc(doc(db, 'users', currentUser.id), {
+          searchIndexVersion: 1
+        });
+        setCurrentUser(prev => prev ? { ...prev, searchIndexVersion: 1 } : null);
+        setOptimizeProgress({
+          processed: totalProcessed,
+          failed: [],
+          statusText: `¡Optimización completada con éxito! Se indexaron ${totalProcessed} inventarios.`,
+          isFinished: true
+        });
+        showNotify('Optimización de búsqueda completada exitosamente', 'success');
+      } else {
+        setOptimizeProgress({
+          processed: totalProcessed,
+          failed: failedItems,
+          statusText: `Proceso finalizado con incidencias. ${failedItems.length} inventario(s) no se pudieron optimizar.`,
+          isFinished: true
+        });
+        showNotify(`${failedItems.length} inventario(s) no se pudieron optimizar`, 'warning');
+      }
+    } catch (err: any) {
+      console.error('Error general durante la optimización de búsqueda:', err);
+      showNotify(`Error durante la optimización: ${err?.message || 'Error de conexión'}`, 'error');
+      setOptimizeProgress({
+        processed: totalProcessed,
+        failed: failedItems,
+        statusText: `Error durante la optimización: ${err?.message || 'Verifica tu conexión y reintenta'}`,
+        isFinished: true
+      });
+    } finally {
+      setIsOptimizingSearch(false);
+    }
+  };
+
   const handleConfirmAssignment = async () => {
     if (!assigningInventory || !selectedDependentForAssign || !currentUser) return;
 
@@ -2529,6 +2726,7 @@ export default function App() {
         assignedToName: fullName,
         assignedAt: now,
         assignedBy: currentUser.id,
+        isAssigned: true,
         updatedAt: now,
         assignmentHistory: arrayUnion({
           to: dep.id,
@@ -2571,6 +2769,7 @@ export default function App() {
       await updateDoc(invRef, {
         assignedTo: null,
         assignedToName: null,
+        isAssigned: false,
         updatedAt: now,
         assignmentHistory: arrayUnion({
           to: null,
@@ -3155,6 +3354,12 @@ export default function App() {
         updateData.ownerEmail = receptionEmail.trim().toLowerCase();
         if (receptionName.trim()) updateData.ownerName = receptionName.trim();
       }
+
+      updateData.isReceived = true;
+      updateData.searchTokens = buildSearchTokens({
+        ...currentInventory,
+        ...updateData
+      });
 
       const sanitizedUpdate = sanitizeData(updateData);
 
@@ -4101,6 +4306,130 @@ export default function App() {
                     </div>
                   );
                 })()}
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Search Optimization Progress Modal */}
+      <AnimatePresence>
+        {showOptimizeModal && (
+          <div className="fixed inset-0 z-[110] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 bg-black/60 backdrop-blur-md"
+              onClick={() => {
+                if (!isOptimizingSearch) setShowOptimizeModal(false);
+              }}
+            />
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0, y: 20 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.9, opacity: 0, y: 20 }}
+              className="bg-white rounded-[2.5rem] p-8 max-w-lg w-full relative z-10 shadow-2xl border border-black/5 overflow-hidden"
+            >
+              <div className="flex justify-between items-start mb-6">
+                <div className="flex items-center gap-3">
+                  <div className="w-12 h-12 bg-black/5 rounded-2xl flex items-center justify-center text-black">
+                    <Sparkles size={24} />
+                  </div>
+                  <div>
+                    <h3 className="text-xl font-bold tracking-tight">Optimizar Búsqueda</h3>
+                    <p className="text-muted text-xs font-medium">Indexación de inventarios para consulta en servidor</p>
+                  </div>
+                </div>
+                {!isOptimizingSearch && (
+                  <button 
+                    onClick={() => setShowOptimizeModal(false)}
+                    className="w-10 h-10 flex items-center justify-center rounded-full hover:bg-black/5 transition-colors"
+                  >
+                    <X size={20} />
+                  </button>
+                )}
+              </div>
+
+              <div className="space-y-6">
+                {/* Progress bar */}
+                <div className="space-y-2">
+                  <div className="flex justify-between text-xs font-bold">
+                    <span className="text-muted">Progreso</span>
+                    <span>{optimizeProgress?.processed || 0} inventarios procesados</span>
+                  </div>
+                  <div className="w-full h-3 bg-black/5 rounded-full overflow-hidden">
+                    <motion.div 
+                      className={`h-full ${optimizeProgress?.failed && optimizeProgress.failed.length > 0 ? 'bg-amber-500' : 'bg-black'}`}
+                      initial={{ width: 0 }}
+                      animate={{ 
+                        width: isOptimizingSearch ? '75%' : (optimizeProgress?.isFinished ? '100%' : '20%')
+                      }}
+                      transition={{ duration: 0.5 }}
+                    />
+                  </div>
+                </div>
+
+                {/* Status text */}
+                <div className="p-4 bg-[#f8f9fa] rounded-2xl border border-black/5">
+                  <p className="text-xs text-black font-medium leading-relaxed">
+                    {optimizeProgress?.statusText || 'Procesando...'}
+                  </p>
+                </div>
+
+                {/* Failed items notice if any */}
+                {optimizeProgress?.failed && optimizeProgress.failed.length > 0 && (
+                  <div className="p-4 bg-red-50 border border-red-200 rounded-2xl space-y-3">
+                    <div className="flex items-center gap-2 text-red-700 font-bold text-xs">
+                      <AlertCircle size={16} />
+                      <span>{optimizeProgress.failed.length} inventarios no se pudieron optimizar:</span>
+                    </div>
+                    <div className="max-h-36 overflow-y-auto space-y-1.5 pr-1">
+                      {optimizeProgress.failed.map(f => (
+                        <div key={f.id} className="text-[11px] bg-white p-2 rounded-xl border border-red-100 flex items-center justify-between">
+                          <span className="font-semibold text-neutral-800">Código: {f.internalCode}</span>
+                          <span className="text-red-600 text-[10px] truncate max-w-[200px]" title={f.error}>{f.error}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Action buttons */}
+              <div className="mt-8 flex gap-3">
+                {isOptimizingSearch ? (
+                  <div className="w-full py-4 bg-black/10 text-muted rounded-2xl font-bold flex items-center justify-center gap-2 text-sm">
+                    <div className="w-4 h-4 border-2 border-black/40 border-t-transparent rounded-full animate-spin" />
+                    <span>Optimizando base de datos...</span>
+                  </div>
+                ) : (
+                  <>
+                    {optimizeProgress?.failed && optimizeProgress.failed.length > 0 ? (
+                      <>
+                        <button
+                          onClick={() => setShowOptimizeModal(false)}
+                          className="flex-1 py-3.5 rounded-2xl font-bold text-muted hover:bg-black/5 transition-all text-sm"
+                        >
+                          Cerrar
+                        </button>
+                        <button
+                          onClick={handleOptimizeSearch}
+                          className="flex-1 py-3.5 bg-black text-white rounded-2xl font-bold hover:bg-black/80 transition-all text-sm shadow-lg shadow-black/10"
+                        >
+                          Reintentar
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        onClick={() => setShowOptimizeModal(false)}
+                        className="w-full py-3.5 bg-black text-white rounded-2xl font-bold hover:bg-black/80 transition-all text-sm shadow-lg shadow-black/10"
+                      >
+                        Aceptar
+                      </button>
+                    )}
+                  </>
+                )}
               </div>
             </motion.div>
           </div>
@@ -5486,6 +5815,31 @@ export default function App() {
                 </div>
               </div>
 
+              {/* Notice Banner: Search Optimization needed for Admin if searchIndexVersion !== 1 */}
+              {currentUser.role === 'admin' && currentUser.searchIndexVersion !== 1 && (
+                <div className="bg-amber-50 border border-amber-200 rounded-[2rem] p-6 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 shadow-sm">
+                  <div className="flex items-center gap-4">
+                    <div className="w-12 h-12 rounded-2xl bg-amber-100 text-amber-800 flex items-center justify-center shrink-0">
+                      <Sparkles size={24} />
+                    </div>
+                    <div>
+                      <h4 className="font-bold text-amber-950 text-base">Optimización de Búsqueda Pendiente</h4>
+                      <p className="text-xs text-amber-800/90 mt-1 max-w-xl">
+                        Es necesario optimizar los inventarios de tu agencia para habilitar consultas rápidas y filtros avanzados en el servidor.
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={handleOptimizeSearch}
+                    disabled={isOptimizingSearch}
+                    className="w-full sm:w-auto px-5 py-3 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold transition-all shadow-md shadow-amber-600/20 shrink-0 disabled:opacity-50 flex items-center justify-center gap-2"
+                  >
+                    <Sparkles size={16} />
+                    <span>{isOptimizingSearch ? 'Optimizando...' : 'Optimizar búsqueda'}</span>
+                  </button>
+                </div>
+              )}
+
               <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
                 <div className="bg-white rounded-[2rem] p-8 border border-black/5 shadow-sm space-y-6">
                   <div className="flex items-center gap-4">
@@ -5572,8 +5926,6 @@ export default function App() {
                   </div>
                 </div>
 
-
-
                 {currentUser.role === 'admin' && (
                   <div className="bg-white rounded-[2rem] p-8 border border-black/5 shadow-sm space-y-6">
                     <div className="flex items-center gap-3 mb-2">
@@ -5594,6 +5946,33 @@ export default function App() {
                           {dependents.length}
                         </span>
                       )}
+                    </button>
+                  </div>
+                )}
+
+                {currentUser.role === 'admin' && (
+                  <div className="bg-white rounded-[2rem] p-8 border border-black/5 shadow-sm space-y-6">
+                    <div className="flex items-center gap-3 mb-2">
+                      <div className="w-10 h-10 bg-black/5 text-black rounded-xl flex items-center justify-center">
+                        <Sparkles size={20} />
+                      </div>
+                      <div>
+                        <h3 className="text-xl font-bold">Optimización de Búsqueda</h3>
+                        <p className="text-xs text-muted font-medium">Indexación de inventarios en el servidor.</p>
+                      </div>
+                    </div>
+                    <p className="text-sm text-muted">
+                      {currentUser.searchIndexVersion === 1 
+                        ? 'Los inventarios de tu agencia están optimizados para búsqueda instantánea en el servidor. Puedes volver a ejecutar la optimización si lo requieres.' 
+                        : 'Actualiza y genera los prefijos de búsqueda, estado de recepción y asignación en todos los inventarios de la agencia.'}
+                    </p>
+                    <button 
+                      onClick={handleOptimizeSearch}
+                      disabled={isOptimizingSearch}
+                      className="w-full py-4 bg-black text-white rounded-2xl font-bold hover:bg-black/80 transition-all flex items-center justify-center gap-2 shadow-lg shadow-black/10 disabled:opacity-50"
+                    >
+                      <Sparkles size={18} />
+                      <span>{isOptimizingSearch ? 'Optimizando inventarios...' : 'Optimizar búsqueda'}</span>
                     </button>
                   </div>
                 )}

@@ -3,6 +3,7 @@ import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { Resend } from 'resend';
 import dotenv from 'dotenv';
+import { buildSearchTokens } from './src/lib/searchTokens';
 import admin from 'firebase-admin';
 import { getFirestore } from 'firebase-admin/firestore';
 import fs from 'fs';
@@ -581,12 +582,14 @@ async function startServer() {
         updatePayload.ownerDeliverySignature = signature;
         updatePayload.ownerDeliveryDate = nowIso;
         updatePayload.ownerRemoteSigned = true;
+        updatePayload.isReceived = true;
         if (signerEmail) updatePayload.ownerEmail = signerEmail.trim().toLowerCase();
         if (signerName) updatePayload.ownerName = signerName.trim();
       } else if (role === 'reception_tenant') {
         updatePayload.tenantReceiveSignature = signature;
         updatePayload.tenantReceiveDate = nowIso;
         updatePayload.tenantRemoteSigned = true;
+        updatePayload.isReceived = true;
         if (signerEmail) updatePayload.tenantEmail = signerEmail.trim().toLowerCase();
         if (signerName) updatePayload.tenantName = signerName.trim();
       } else if (role === 'owner') {
@@ -608,6 +611,15 @@ async function startServer() {
           updatePayload.completedAt = Date.now();
         }
       }
+
+      // Keep searchTokens updated if names or fields were updated
+      updatePayload.searchTokens = buildSearchTokens({
+        propertyName: data.propertyName,
+        address: data.address,
+        internalCode: data.internalCode,
+        ownerName: updatePayload.ownerName !== undefined ? updatePayload.ownerName : data.ownerName,
+        tenantName: updatePayload.tenantName !== undefined ? updatePayload.tenantName : data.tenantName,
+      });
 
       // Execute atomic update in Firestore
       await invRef.update(updatePayload);

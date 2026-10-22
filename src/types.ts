@@ -28,6 +28,7 @@ export interface User {
   adminPlan?: 'monthly' | 'yearly' | 'license';
   ownerTemplate?: string;
   tenantTemplate?: string;
+  searchIndexVersion?: number;
 }
 
 export interface LicenseEvent {
@@ -212,4 +213,7 @@ export interface Inventory {
   assignmentHistory?: { to: string | null; toName: string | null; by: string; byName: string; at: number }[];
   photoMeta?: Record<string, { url: string; storagePath: string; spaceId?: string; timestamp?: number; caption?: string; syncedAt: number }>;
   completedAt?: number;
+  searchTokens?: string[];
+  isReceived?: boolean;
+  isAssigned?: boolean;
 }

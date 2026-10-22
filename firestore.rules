@@ -72,7 +72,8 @@ service cloud.firestore {
              (!('updatedAt' in data) || (data.updatedAt is number || data.updatedAt is int) || (data.updatedAt is string && data.updatedAt.size() < 100)) &&
              (!('ownerTemplate' in data) || (data.ownerTemplate is string && data.ownerTemplate.size() < 100000)) &&
              (!('tenantTemplate' in data) || (data.tenantTemplate is string && data.tenantTemplate.size() < 100000)) &&
-             (!('phone' in data) || data.phone == null || (data.phone is string && data.phone.size() < 30));
+             (!('phone' in data) || data.phone == null || (data.phone is string && data.phone.size() < 30)) &&
+             (!('searchIndexVersion' in data) || data.searchIndexVersion == null || (data.searchIndexVersion is number || data.searchIndexVersion is int));
     }
 
     function isValidLicense(data) {
@@ -143,7 +144,10 @@ service cloud.firestore {
              (!('assignmentHistory' in data) || data.assignmentHistory == null || (data.assignmentHistory is list && data.assignmentHistory.size() < 200)) &&
              (!('photoMeta' in data) || data.photoMeta == null || data.photoMeta is map) &&
              (!('photoCount' in data) || data.photoCount == null || (data.photoCount is number || data.photoCount is int)) &&
-             (!('completedAt' in data) || data.completedAt == null || (data.completedAt is number || data.completedAt is int));
+             (!('completedAt' in data) || data.completedAt == null || (data.completedAt is number || data.completedAt is int)) &&
+             (!('searchTokens' in data) || data.searchTokens == null || (data.searchTokens is list && data.searchTokens.size() < 400)) &&
+             (!('isReceived' in data) || data.isReceived == null || data.isReceived is bool) &&
+             (!('isAssigned' in data) || data.isAssigned == null || data.isAssigned is bool);
     }
 
     function hasText(v) { 
@@ -173,6 +177,10 @@ service cloud.firestore {
         (request.resource.data.get('assignedTo', null) == null ||
          (exists(/databases/$(database)/documents/users/$(request.resource.data.assignedTo)) &&
           get(/databases/$(database)/documents/users/$(request.resource.data.assignedTo)).data.get('adminEmail','') == resource.data.get('adminEmail',''))));
+    }
+
+    function isAssignedConsistent() {
+      return request.resource.data.get('isAssigned', false) == (request.resource.data.get('assignedTo', null) != null);
     }
 
     // ===============================================================
@@ -296,6 +304,7 @@ service cloud.firestore {
       allow update: if isAuthenticated() && 
                     isUserActive() && 
                     isValidInventory(request.resource.data) && 
+                    isAssignedConsistent() &&
                     (
                       isSuperAdmin() ||
                       isUserInSameAgency(resource.data.get('adminEmail', ''), resource.data.get('createdBy', ''))

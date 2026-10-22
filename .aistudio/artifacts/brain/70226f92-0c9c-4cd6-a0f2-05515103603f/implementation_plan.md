@@ -1,204 +1,229 @@
-# Preparación de Datos para Consultas, Filtros y Búsqueda en el Servidor (Firestore)
+# Lista Paginada, Filtros y Búsqueda en Servidor de Inventarios
 
-Plan arquitectónico y técnico para preparar los inventarios con campos calculados derivados (`searchTokens`, `isReceived`, `isAssigned`), garantizar su mantenimiento síncrono en todas las operaciones del cliente y del servidor, crear e implementar índices compuestos en Firestore, proveer migración por lotes paginada para administradores y blindar las reglas de seguridad.
+Plan de ingeniería para transformar la gestión de inventarios de la agencia en una arquitectura orientada al servidor: paginación de 30 en 30 documentos con tiempo real en la primera página, consultas especializadas por pestaña, contadores con agregaciones de servidor (`getCountFromServer`), búsqueda indexada por prefijos (`searchTokens`) y consultas optimizadas para dependientes, manteniendo idéntico el aspecto visual actual de la aplicación.
 
 ---
 
-## User Review & Critical Decisions
+## Decisiones Críticas y Resumen de Revisión
 
 > [!IMPORTANT]
-> Este plan se enfoca **exclusivamente** en la preparación de datos, infraestructura de base de datos y migración técnica. No modifica la apariencia visual existente de la aplicación ni la experiencia de usuario, salvo por la adición de la herramienta de optimización y migración en el Perfil de Administradores con su respectivo aviso de indexación pendiente.
+> **Preservación Visual Total:** Toda la interfaz de usuario existente (pestañas con contadores, tarjetas con etiquetas de estado, barra de búsqueda, modal de dependientes y botón de acción) conserva su diseño, tipografía, paleta Tailwind y micro-interacciones. La transformación es 100% de fontanería arquitectónica y consumo de datos Firestore.
 
-- **Campos Derivados**: `searchTokens`, `isReceived` e `isAssigned` son 100% deterministas y se recalculan automáticamente en todos los puntos de mutación.
-- **Rendimiento y Cuotas**: El límite de tokens se fija en un máximo estricto de 300 elementos por inventario para optimizar el tamaño de los documentos y el rendimiento de las consultas `array-contains`.
-- **Tolerancia a Fallos en Migración**: La migración se ejecuta en páginas de 50 documentos con lotes `writeBatch` de máximo 400 escrituras, garantizando idempotencia, reanudación ante caídas de red y feedback visual paso a paso.
-
----
-
-## 1. Overview & Core Concept
-
-Actualmente, las consultas y filtros avanzados dependen de operaciones en memoria en el cliente tras descargar colecciones completas. Para permitir que el sistema escale a miles de inventarios por agencia sin degradación de latencia ni consumo excesivo de lecturas en Firestore, se requiere:
-
-1. **Campos Derivados de Alta Eficiencia**:
-   - `searchTokens`: Permite búsquedas textuales de prefijo instantáneas mediante consultas `array-contains` en Firestore.
-   - `isReceived`: Flag booleano (`true` si existe firma en acta de entrega o de recibido) para filtrar inventarios recibidos sin inspeccionar campos de firma voluminosos.
-   - `isAssigned`: Flag booleano (`true` si `assignedTo` está presente) para filtrar rápidamente asignaciones de dependientes.
-2. **Mantenimiento Reactivo Garantizado**:
-   - Todo flujo de guardado, finalización, firma remota, acta presencial o asignación actualiza estos campos de forma atómica.
-3. **Migración Histórica y Versionado**:
-   - Herramienta para que el administrador indexe el histórico existente en páginas de 50 registros por lotes seguros, marcando `searchIndexVersion: 1` en su perfil al completar.
+* **Estrategia Híbrida de Paginación (Página 1 Live + "Cargar más" Snapshot):** La primera página (30 registros) se suscribe en vivo mediante `onSnapshot` para que creaciones o modificaciones recientes aparezcan de inmediato. Las páginas posteriores (2, 3, etc.) se cargan bajo demanda con `getDocs + startAfter` mediante un botón "Cargar más" discreto que solo aparece si la última página vino completa (30 documentos).
+* **Contadores con `getCountFromServer` y Caché de 60s:** Las etiquetas numéricas de las 6 pestañas ya no computan `inventories.length` en memoria cliente. Se consultan directamente a la API de agregación de Firestore al entrar y se refrescan automáticamente tras eventos de mutación (guardar, archivar, asignar) o cuando expire la caché de 60 segundos. En modo sin conexión, muestran los últimos valores o se mitigan limpiamente.
+* **Búsqueda Normalizada en Servidor:** Al escribir en el buscador con 400 ms de debounce, se aprovecha el índice compuesto `array-contains` sobre `searchTokens` combinado con los filtros de la pestaña activa. Para consultas multi-término, la primera palabra de 2+ caracteres ejecuta el filtro en servidor y las palabras adicionales refinan en memoria sobre los documentos devueltos.
+* **Consultas Puntuales para Reglas de Negocio:** Se desacoplan las validaciones de unicidad de `internalCode` y el borrado de duplicados archivados de la lista general en memoria, ejecutando consultas específicas con `limit(5)` al servidor. Si una acción requiere un inventario fuera de las páginas visibles, se recupera mediante `getDoc(doc(db, 'inventories', id))`.
+* **Consultas de Dependientes Desacopladas:** Se reemplaza el listener genérico `limit(100)` del rol dependiente por tres consultas concurrentes de solo los documentos estrictamente relevantes (borradores propios, asignaciones directas y completados dentro de la ventana de gracia de 48h).
 
 ---
 
-## 2. User Experience & Visual Design
+## 1. Visión General y Concepto Central
 
-Conforme al requerimiento ("No cambies la interfaz ni nada más"), la interfaz se mantiene intacta con dos únicos agregados discretos en la vista de Perfil/Ajustes de administradores:
+### Qué Resuelve
+Actualmente, la aplicación realizaba una carga en memoria de hasta 100 inventarios por agencia. Al escalar a cientos o miles de inventarios, esta aproximación consume cuota de lectura innecesaria, satura la memoria del navegador móvil y ralentiza el filtrado.
 
-1. **Aviso de Indexación Pendiente (Solo Administradores)**:
-   - Se muestra un banner informativo en la sección de configuración mientras `currentUser.searchIndexVersion !== 1`:
-     - *"Tu cuenta aún no tiene optimizada la base de datos para búsquedas rápidas. Ejecuta la optimización para acelerar las consultas."*
-2. **Botón y Modal de "Optimizar búsqueda"**:
-   - Botón accesible en el Perfil del Administrador.
-   - Al pulsar, abre un modal/panel de progreso con:
-     - Estado del proceso: *"Optimizando inventario X de Y..."*
-     - Barra de progreso porcentual fluida.
-     - Botón para reintentar en caso de pérdida de conexión (operación idempotente y repetible).
-     - Al completar exitosamente: guarda `searchIndexVersion: 1` en el documento del usuario en Firestore y emite notificación de éxito.
+La nueva arquitectura transfiere la carga pesada al motor de índices de Firestore:
+1. **Reducción de Lecturas:** Solo se descargan 30 documentos por vista en lugar de 100, y los contadores de pestañas consumen únicamente agregaciones de metadatos (1 lectura de agregación cada 1000 documentos contabilizados).
+2. **Consultas Indexadas en Servidor:** Cada pestaña ejecuta una query nativa con índices compuestos ya desplegados (`[status]`, `[isReceived]`, `[status, isReceived, isAssigned]`, etc.).
+3. **Resiliencia Offline:** Integración nativa con la caché persistente de Firestore para seguir navegando páginas ya vistas con el aviso contextual "Mostrando datos guardados en el teléfono".
 
 ---
 
-## 3. Key Product Decisions & Trade-Offs
+## 2. Experiencia de Usuario y Flujos
 
-### Decisión 1: Algoritmo de Generación de `searchTokens`
-- **Algoritmo**:
-  1. Extrae los textos clave del inventario: `propertyName`, `address`, `internalCode`, `ownerName` y `tenantName`.
-  2. Normalización fonética/ortográfica: conversión a minúsculas, eliminación de marcas diacríticas/tildes (`normalize("NFD").replace(/[\u0300-\u036f]/g, "")`), y filtrado de caracteres no alfanuméricos.
-  3. Tokenización: división en palabras de 2 o más caracteres.
-  4. Generación de prefijos (n-gramas): para cada palabra, genera todos los prefijos desde 2 hasta 12 caracteres (ejemplo: "apartamento" $\rightarrow$ `["ap", "apa", "apar", "apart", "aparta", "apartam", "apartame", "apartamen", "apartament", "apartamento"]`).
-  5. Inclusión del `internalCode` completo en su forma normalizada.
-  6. Deduplicación mediante `Set` y limitación a un máximo de 300 tokens por documento.
-- **Por qué**: Permite coincidencias parciales por prefijo en tiempo real con `array-contains` en Firestore sin necesidad de integrar motores externos (como Algolia o Typesense), manteniendo el costo de infraestructura en cero.
+### Flujo del Administrador
+1. **Carga Inicial y Pestañas:**
+   * Al acceder a "Mis Inventarios", se ejecutan en paralelo:
+     * La suscripción en vivo de la primera página (30 inventarios más recientes según la pestaña seleccionada).
+     * El cálculo de contadores de cada pestaña con `getCountFromServer` (con TTL de 60s).
+   * Al cambiar de pestaña ("Todos", "Borradores", "Listos", "Firmados sin asignar", "Recibidos", "Archivados"), se cancela la suscripción anterior, se limpia la paginación y se inicia la nueva consulta de 30 ítems.
+2. **Paginación Infinita ("Cargar más"):**
+   * Al final del grid de tarjetas, si la página actual tiene 30 documentos, se muestra el botón "Cargar más inventarios".
+   * Al hacer clic, se ejecuta `getDocs` con `startAfter(lastVisibleDoc)` para añadir los siguientes 30 inventarios a la lista combinada (deduplicada por `id`).
+   * Si una página devuelve menos de 30 inventarios, el botón se oculta automáticamente.
+3. **Búsqueda Instantánea con Debounce:**
+   * Al teclear en el campo de búsqueda, tras 400 ms de inactividad, se genera la consulta con `searchTokens array-contains` combinada con la pestaña activa.
+   * Si no hay coincidencias, se muestra el estado visual "Sin resultados" con el botón para limpiar la búsqueda.
+4. **Modal de Inventarios por Dependiente:**
+   * Al hacer clic en un dependiente desde la vista de equipo, su historial ya no filtra una lista local; consulta bajo demanda sus inventarios creados y asignados en bloques de 30 con `getCountFromServer` para su contador.
 
-### Decisión 2: Inicialización de `assignedTo: null`
-- **Por qué**: Firestore no indexa campos ausentes (`undefined`) en índices compuestos. Escribir explícitamente `assignedTo: null` e `isAssigned: false` al crear inventarios asegura que los documentos aparezcan correctamente en las consultas compuestas de inventarios no asignados.
-
-### Decisión 3: Migración por Lotes y Paginada
-- **Estrategia**:
-  - Lectura en páginas de 50 documentos (`query(..., where("adminEmail", "==", email), orderBy("updatedAt"), startAfter(lastDoc), limit(50))`).
-  - Acumulación de escrituras en `writeBatch(db)` con commit cada 400 operaciones (respetando el límite estricto de 500 de Firestore con margen de seguridad).
-  - Manejo de reintentos individuales ante fallas temporales de red sin reiniciar desde cero.
+### Flujo del Dependiente
+* El dependiente consulta exactamente lo que tiene derecho a ver:
+  1. Sus borradores en curso (`createdBy == uid && status == 'draft'`).
+  2. Sus asignaciones activas de entrega/recibo (`assignedTo == uid`).
+  3. Sus inventarios finalizados recientemente (`createdBy == uid && status == 'completed' && completedAt > ahora - 48h`).
+* Se unen los resultados sin duplicados y se registran en `PhotoSyncEngine.setPersistedInventories` para mantener sincronizadas las fotografías offline.
 
 ---
 
-## 4. Technical Architecture & Data Strategy
+## 3. Decisiones de Producto y Compensaciones Técnicas
+
+| Decisión | Enfoque Seleccionado | Razón Técnica y de Rendimiento |
+| :--- | :--- | :--- |
+| **Paginación Live vs. Estática** | Híbrida: Página 1 con `onSnapshot` + Páginas 2..N con `getDocs` | Garantiza que cualquier cambio inmediato o creación se vea al instante sin pagar el coste de mantener abiertos listeners masivos de páginas profundas. |
+| **Conteo de Pestañas** | `getCountFromServer` con memoria caché de 60s | Evita descargar miles de documentos completos solo para mostrar un badge numérico. El TTL de 60s previene sobrecostes de API al navegar entre pestañas. |
+| **Búsqueda Multi-palabra** | Primer término `array-contains` en servidor + filtrado cliente del resto | Firestore no permite múltiples operadores `array-contains` en una misma consulta. Filtrar el segundo término sobre el lote resultante es instantáneo y respeta las limitaciones del motor de Firestore. |
+| **Lectura de Tarjetas** | Lectura estricta de `inv.photoCount ?? 0` | Elimina la iteración profunda `inv.spaces.reduce(...)` sobre arreglos de fotos en cada renderizado, mejorando drásticamente el scrolling a 60fps en dispositivos móviles. |
+
+---
+
+## 4. Arquitectura Técnica y Estrategia de Datos
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│                          INVENTORY LIFECYCLE                           │
-└────────────────────────────────────────────────────────────────────────┘
+│                        App.tsx (Vista Inventarios)                     │
+└───────────────────────────────────┬────────────────────────────────────┘
                                     │
-    ┌───────────────────────────────┴───────────────────────────────┐
-    ▼                                                               ▼
-[Client Mutator Points]                                    [Server Mutator Points]
- - saveInventory (draft / completed)                        - POST /api/remote-sign/confirm
- - confirmFinalSave                                           (tenantReceiveSignature /
- - handleSaveReception (owner / tenant)                        ownerDeliverySignature)
- - handleAssignDependent / Unassign                                  │
-    │                                                                │
-    ▼                                                                ▼
+         ┌──────────────────────────┴──────────────────────────┐
+         ▼                                                     ▼
+┌─────────────────────────────────┐   ┌──────────────────────────────────┐
+│      Query Manager Admin        │   │     Query Manager Dependiente    │
+│  - Tab Query Builder            │   │  - Drafts Query (createdBy)      │
+│  - Live onSnapshot (Page 1: 30) │   │  - Assigned Query (assignedTo)   │
+│  - getDocs + startAfter (>30)   │   │  - Grace Period Query (48h)      │
+│  - searchTokens array-contains  │   │  - Union & Local Cache           │
+└────────────────┬────────────────┘   └────────────────┬─────────────────┘
+                 │                                     │
+                 ▼                                     ▼
+┌─────────────────────────────────┐   ┌──────────────────────────────────┐
+│     Count Cache (60s TTL)       │   │    PhotoSyncEngine Integration   │
+│  - getCountFromServer por Tab   │   │  - setPersistedInventories(ids)  │
+│  - Invalidation on Mutation     │   │  - Offline IndexedDB Sync        │
+└────────────────┬────────────────┘   └──────────────────────────────────┘
+                 │
+                 ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│                   CALCULATE DERIVED FIELDS (Atómica)                   │
-│  - isReceived = !!(tenantReceiveSignature || ownerDeliverySignature)   │
-│  - isAssigned = !!assignedTo                                           │
-│  - searchTokens = buildSearchTokens(inventory)                         │
-└────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│                   FIRESTORE PERSISTENCE & INDEXES                      │
-│  - Inventories Collection (/inventories/{id})                          │
-│  - Compound Indexes (adminEmail, status, isReceived, isAssigned...)    │
-│  - firestore.rules validation (searchTokens < 400, booleans)           │
-└────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│                    ADMIN MIGRATION ENGINE (Profile)                    │
-│  - Query chunks of 50 (adminEmail == email, orderBy updatedAt)         │
-│  - writeBatch chunks (max 400)                                         │
-│  - Progress Tracker UI                                                 │
-│  - Set searchIndexVersion: 1 on user doc upon completion               │
+│        Firestore Database (ai-studio-70226f92-0c9c-4cd6-a0f2-...)      │
+│   Índices Compuestos de Consulta y Agregaciones Server-Side            │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Componentes y Archivos Clave a Modificar
+### 4.1 Definición de Consultas por Pestaña
 
-1. **`src/types.ts`**:
-   - Agregar campos opcionales en `Inventory`:
-     ```ts
-     searchTokens?: string[];
-     isReceived?: boolean;
-     isAssigned?: boolean;
-     ```
-   - Agregar campo opcional en `User`:
-     ```ts
-     searchIndexVersion?: number;
-     ```
+```typescript
+// Configuración de filtros según pestaña activa
+function buildTabConstraints(statusFilter: string, adminEmail: string) {
+  const base = [where('adminEmail', '==', adminEmail)];
+  switch (statusFilter) {
+    case 'draft':
+      return [...base, where('status', '==', 'draft')];
+    case 'completed':
+      return [...base, where('status', '==', 'completed')];
+    case 'received':
+      return [...base, where('isReceived', '==', true)];
+    case 'archived':
+      return [...base, where('status', '==', 'archived')];
+    case 'unassigned':
+      return [
+        ...base, 
+        where('status', '==', 'completed'), 
+        where('isReceived', '==', false), 
+        where('isAssigned', '==', false)
+      ];
+    case 'all':
+    default:
+      return base;
+  }
+}
+```
 
-2. **`src/lib/searchTokens.ts` (Nuevo Módulo Utilitario)**:
-   - Función pura `buildSearchTokens(inv: Partial<Inventory>): string[]`:
-     - Normalización (`normalize("NFD")`, regex `[^a-z0-9]`).
-     - Prefijos de 2 a 12 caracteres por palabra.
-     - Inclusión de `internalCode` normalizado.
-     - Límite de 300 tokens deduplicados.
-   - Función pura `computeDerivedInventoryFields(inv: Partial<Inventory>)`:
-     - Retorna `{ searchTokens, isReceived, isAssigned }`.
+### 4.2 Lógica de Búsqueda Normalizada con Debounce
+* Normalización con `normalizeText(query)`.
+* Detección de palabras: `words = normalized.split(/\s+/).filter(w => w.length >= 2)`.
+* Si `words.length === 1`:
+  * Query Firestore: `...tabConstraints, where('searchTokens', 'array-contains', words[0]), orderBy('updatedAt', 'desc'), limit(30)`
+* Si `words.length > 1`:
+  * Query Firestore con `words[0]`.
+  * Filtro cliente para verificar que `words[1..N]` existan en `inv.searchTokens`.
+* Debounce de 400ms gestionado mediante `useRef` de temporizador para evitar consultas intermedias innecesarias al tipear.
 
-3. **Puntos de Mantenimiento en `src/App.tsx`**:
-   - **`saveInventory`**: Al preparar `newDocData` y `updateDocData`, calcular e incluir `searchTokens`, `isReceived`, `isAssigned`. Al crear nuevo documento, asegurar `assignedTo: null` e `isAssigned: false`.
-   - **`confirmFinalSave`**: Asegurar que los datos pasados a `saveInventory` recalculen los campos derivados.
-   - **`handleSaveReception`**: Al guardar firmas de acta de inquilino o propietario presenciales, escribir `isReceived: true` y recalcular `searchTokens` si cambiaron nombres.
-   - **Asignación / Desasignación de Dependientes**:
-     - `handleAssignDependent`: escribir `assignedTo`, `assignedToName`, `assignedAt`, `assignedBy`, `isAssigned: true`.
-     - `handleUnassignDependent`: escribir `assignedTo: null`, `assignedToName: null`, `isAssigned: false`.
-   - **Creación de Borrador Inicial (`startNewInventory`)**: Inicializar con `assignedTo: null` e `isAssigned: false`.
+### 4.3 Agregaciones y Sistema de Contadores
+* Se crea el objeto de estado `tabCounts`:
+  ```typescript
+  interface TabCounts {
+    all: number;
+    draft: number;
+    completed: number;
+    unassigned: number;
+    received: number;
+    archived: number;
+  }
+  ```
+* Se mantiene un `lastCountsFetchTimestamp` (referencia). Si la diferencia contra `Date.now()` es `< 60000 ms`, se reutiliza el valor en caché salvo que se fuerce por una mutación (`saveInventory`, `handleArchiveInventory`, `handleConfirmAssignment`, `handleRemoveAssignment`, `handleSaveReception`).
+* Si `!isOnline`, se mantienen los últimos números conocidos o se oculta suavemente el contador si no está disponible.
 
-4. **Punto de Mantenimiento en `server.ts`**:
-   - En la ruta `/api/remote-sign/confirm`:
-     - Cuando `role === 'reception_owner'` o `role === 'reception_tenant'`, agregar a `updatePayload`:
-       - `isReceived: true`
-     - Recalcular `searchTokens` con `buildSearchTokens` si se actualizó `ownerName` o `tenantName`.
+### 4.4 Reglas de Negocio Desacopladas
+* **Unicidad de `internalCode`:**
+  ```typescript
+  const codeQuery = query(
+    collection(db, 'inventories'),
+    where('adminEmail', '==', effectiveAdminEmail),
+    where('internalCode', '==', internalCode.trim()),
+    limit(5)
+  );
+  const snap = await getDocs(codeQuery);
+  const duplicate = snap.docs.find(d => d.id !== inventoryId && d.data().status !== 'archived');
+  ```
+* **Búsqueda al Archivar:**
+  ```typescript
+  const archivedQuery = query(
+    collection(db, 'inventories'),
+    where('adminEmail', '==', effectiveAdminEmail),
+    where('internalCode', '==', internalCode),
+    where('status', '==', 'archived')
+  );
+  const snap = await getDocs(archivedQuery);
+  // Borrar fotos y documentos de duplicados antiguos archivados antes de archivar el actual
+  ```
+* **Acceso a Documentos no Listados:**
+  * Si `deleteInventory`, `editInventory` o `reassign` recibe un ID que no está en la página cargada, se invoca `getDoc(doc(db, 'inventories', id))` automáticamente.
 
-5. **Herramienta de Migración en Perfil (`src/App.tsx`)**:
-   - Componente/sección en Ajustes (visible solo si `currentUser.role === 'admin'`).
-   - Función `runSearchOptimization()`:
-     - Consulta total de inventarios del tenant para la barra de progreso.
-     - Loop de paginación (`getDocs` con `startAfter(lastDoc)` en lotes de 50).
-     - Procesamiento con `writeBatch` (commit cada 400 documentos).
-     - Guardado de `updateDoc(doc(db, 'users', currentUser.id), { searchIndexVersion: 1, updatedAt: Date.now() })`.
-     - Aviso banner mientras `searchIndexVersion !== 1`.
+### 4.5 Consultas Concurridas para Rol Dependiente
+```typescript
+const qDrafts = query(
+  collection(db, 'inventories'),
+  where('createdBy', '==', currentUser.id),
+  where('status', '==', 'draft')
+);
+const qAssigned = query(
+  collection(db, 'inventories'),
+  where('assignedTo', '==', currentUser.id)
+);
+const qCompletedGrace = query(
+  collection(db, 'inventories'),
+  where('createdBy', '==', currentUser.id),
+  where('status', '==', 'completed'),
+  where('completedAt', '>', Date.now() - GRACE_MS)
+);
+```
+* Se suscriben los 3 listeners y se combinan los resultados en un único mapa por ID ordenado descendentemente por `updatedAt`.
+* Se notifica a `PhotoSyncEngine.getInstance().setPersistedInventories(allCombinedIds)`.
 
-6. **Definición de Índices Compuestos (`firestore.indexes.json`)**:
-   - Crear archivo `firestore.indexes.json` con los 9 índices solicitados:
-     1. `[adminEmail ASC, status ASC, updatedAt DESC]`
-     2. `[adminEmail ASC, isReceived ASC, updatedAt DESC]`
-     3. `[adminEmail ASC, status ASC, isReceived ASC, isAssigned ASC, updatedAt DESC]`
-     4. `[adminEmail ASC, searchTokens ARRAY_CONTAINS, updatedAt DESC]`
-     5. `[adminEmail ASC, status ASC, searchTokens ARRAY_CONTAINS, updatedAt DESC]`
-     6. `[adminEmail ASC, internalCode ASC, updatedAt DESC]`
-     7. `[createdBy ASC, status ASC, updatedAt DESC]`
-     8. `[createdBy ASC, status ASC, completedAt DESC]`
-     9. `[assignedTo ASC, updatedAt DESC]`
-   - Configuración en `firebase.json` para referenciar `firestore.indexes.json`.
-   - Despliegue de índices en Firebase Firestore.
-
-7. **Reglas de Seguridad (`firestore.rules`)**:
-   - En `isValidInventory`:
-     ```cel
-     (!('searchTokens' in data) || data.searchTokens == null || (data.searchTokens is list && data.searchTokens.size() < 400)) &&
-     (!('isReceived' in data) || data.isReceived == null || data.isReceived is bool) &&
-     (!('isAssigned' in data) || data.isAssigned == null || data.isAssigned is bool) &&
-     ```
-   - En `isValidUser`:
-     ```cel
-     (!('searchIndexVersion' in data) || data.searchIndexVersion == null || (data.searchIndexVersion is number || data.searchIndexVersion is int)) &&
-     ```
-   - Despliegue de `firestore.rules` mediante la herramienta `deploy_firebase`.
+### 4.6 Optimización Estricta de Tarjetas
+* En el renderizado del grid de inventarios:
+  * El badge superior de fotos pasa de:
+    `{typeof inv.photoCount === 'number' ? inv.photoCount : inv.spaces.reduce(...)}`
+    a:
+    `{inv.photoCount ?? 0} Fotos`
+  * No se examinan las propiedades `inv.spaces` ni `inv.photos` en el listado, evitando cálculos en memoria durante el renderizado.
 
 ---
 
-## Plan de Verificación y Pruebas
+## 5. Plan de Ejecución por Fases (Una vez aprobado)
 
-1. **Pruebas Unitarias de `buildSearchTokens`**:
-   - Verificar remoción de tildes (ej. "habitación" $\rightarrow$ "habitacion", "cómodo" $\rightarrow$ "comodo").
-   - Verificar prefijos de 2 a 12 caracteres.
-   - Verificar deduplicación y truncamiento seguro a 300 elementos.
-2. **Pruebas de Flujos de Guardado y Mutación**:
-   - Creación de nuevo inventario: verificar `assignedTo: null`, `isAssigned: false`, `isReceived: false` y generación de `searchTokens`.
-   - Firma de acta de recepción presencial y remota: verificar `isReceived: true`.
-   - Asignación a dependiente: verificar `isAssigned: true` y `isAssigned: false` al desasignar.
-3. **Prueba de Migración por Lotes**:
-   - Simular ejecución con inventarios de la agencia, verificando progreso en UI y persistencia de `searchIndexVersion: 1`.
-4. **Compilación y Reglas**:
-   - Ejecutar `compile_applet` y `lint_applet` para verificar tipos y bundling.
-   - Desplegar reglas e índices en Firebase.
+1. **Fase 1: Utilidades y Agregaciones**
+   * Importar `getCountFromServer` de `firebase/firestore`.
+   * Implementar `fetchTabCounts` con control de caché de 60s y refresco reactivo tras eventos de guardado/archivo/asignación.
+2. **Fase 2: Listener Paginado y Búsqueda en Administrador**
+   * Reemplazar el listener `limit(100)` por la suscripción `onSnapshot` de 30 ítems para la página 1 según la pestaña activa y término de búsqueda debounced (400 ms).
+   * Implementar función `handleLoadMore` con `getDocs + startAfter` y el botón "Cargar más inventarios".
+3. **Fase 3: Actualización de Reglas de Negocio en Servidor**
+   * Actualizar la validación de `internalCode` en `saveInventory` para consultar directamente al servidor con `limit(5)`.
+   * Actualizar `handleArchiveInventory` para buscar inventarios archivados previos mediante consulta a Firestore.
+4. **Fase 4: Consultas de Dependientes y Vista de Historial**
+   * Implementar las 3 consultas específicas para dependientes sin límite arbitrario de 100.
+   * Adaptar el modal de historial de dependientes para paginar de 30 en 30 y usar `getCountFromServer`.
+5. **Fase 5: Tarjetas, Aviso Offline y Verificación**
+   * Limpiar la tarjeta para leer estrictamente `photoCount`.
+   * Integrar aviso "Mostrando datos guardados en el teléfono" cuando se cargue desde caché sin conexión.
+   * Ejecutar `compile_applet` y `lint_applet` para certificar la compilación perfecta.
