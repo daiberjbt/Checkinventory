@@ -121,9 +121,11 @@ import {
   writeBatch,
   getDocFromServer,
   arrayUnion,
-  startAfter
+  startAfter,
+  getCountFromServer,
+  DocumentSnapshot
 } from 'firebase/firestore';
-import { buildSearchTokens, computeIsReceived, computeIsAssigned } from './lib/searchTokens';
+import { buildSearchTokens, computeIsReceived, computeIsAssigned, normalizeText } from './lib/searchTokens';
 import { ref, uploadBytesResumable, getDownloadURL, deleteObject } from 'firebase/storage';
 import ReactQuill from 'react-quill-new';
 import 'react-quill-new/dist/quill.snow.css';
@@ -444,7 +446,38 @@ export default function App() {
   const [expandedSpaces, setExpandedSpaces] = useState<Record<string, boolean>>({});
   const [targetSpaceId, setTargetSpaceId] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
+  const [debouncedSearchTerm, setDebouncedSearchTerm] = useState('');
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearchTerm(searchTerm);
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [searchTerm]);
+
   const [statusFilter, setStatusFilter] = useState<'all' | 'draft' | 'completed' | 'unassigned' | 'received' | 'archived'>('all');
+  const [adminLivePage, setAdminLivePage] = useState<Inventory[]>([]);
+  const [adminExtraPages, setAdminExtraPages] = useState<Inventory[]>([]);
+  const [lastVisibleDoc, setLastVisibleDoc] = useState<DocumentSnapshot | null>(null);
+  const [hasMorePages, setHasMorePages] = useState(false);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const [isReadingFromCache, setIsReadingFromCache] = useState(false);
+
+  interface TabCounts {
+    all: number;
+    draft: number;
+    completed: number;
+    unassigned: number;
+    received: number;
+    archived: number;
+  }
+  const [tabCounts, setTabCounts] = useState<TabCounts | null>(null);
+  const lastCountsFetchRef = useRef<number>(0);
+
+  const [dependentCounts, setDependentCounts] = useState<Record<string, number>>({});
+  const [dependentModalInvs, setDependentModalInvs] = useState<Inventory[]>([]);
+  const [dependentModalLoading, setDependentModalLoading] = useState(false);
+  const [dependentModalCount, setDependentModalCount] = useState<number | null>(null);
+  const [dependentModalHasMore, setDependentModalHasMore] = useState(false);
   const [isListening, setIsListening] = useState<string | null>(null);
   const [showConfirm, setShowConfirm] = useState<{
     show: boolean;
@@ -1618,109 +1651,308 @@ export default function App() {
     }, duration);
   };
 
-  // Firestore Listener for Inventories
-  useEffect(() => {
-    if (!currentUser || !isAuthReady) {
-      setInventories([]);
+  // Helper to update local inventory across all state slices immediately
+  const updateLocalInventory = (updated: Inventory) => {
+    setInventories(prev => prev.map(inv => inv.id === updated.id ? updated : inv));
+    setAdminLivePage(prev => {
+      const exists = prev.some(i => i.id === updated.id);
+      return exists ? prev.map(i => i.id === updated.id ? updated : i) : [updated, ...prev];
+    });
+    setAdminExtraPages(prev => prev.map(inv => inv.id === updated.id ? updated : inv));
+  };
+
+  // Contadores de las pestañas con getCountFromServer y caché de 60 s
+  const fetchTabCounts = async (force: boolean = false) => {
+    if (!currentUser || currentUser.role !== 'admin' || !currentUser.email) return;
+    if (!navigator.onLine) return;
+
+    const now = Date.now();
+    if (!force && lastCountsFetchRef.current && (now - lastCountsFetchRef.current < 60000) && tabCounts !== null) {
       return;
     }
 
-    // Admin sees all inventories they created or where they are the adminEmail
-    // Dependent sees inventories they created AND inventories assigned to them
-    // We limit to 100 most recent to save quota
-    if (currentUser.role === 'admin') {
-      const q = query(
-        collection(db, 'inventories'), 
-        where('adminEmail', '==', currentUser.email),
-        orderBy('updatedAt', 'desc'),
-        limit(100)
+    try {
+      const email = currentUser.email;
+      const invCol = collection(db, 'inventories');
+
+      const qAll = query(invCol, where('adminEmail', '==', email));
+      const qDraft = query(invCol, where('adminEmail', '==', email), where('status', '==', 'draft'));
+      const qCompleted = query(invCol, where('adminEmail', '==', email), where('status', '==', 'completed'));
+      const qReceived = query(invCol, where('adminEmail', '==', email), where('isReceived', '==', true));
+      const qArchived = query(invCol, where('adminEmail', '==', email), where('status', '==', 'archived'));
+      const qUnassigned = query(
+        invCol, 
+        where('adminEmail', '==', email), 
+        where('status', '==', 'completed'), 
+        where('isReceived', '==', false), 
+        where('isAssigned', '==', false)
       );
 
-      const unsubscribe = onSnapshot(q, (snapshot) => {
+      const [resAll, resDraft, resCompleted, resReceived, resArchived, resUnassigned] = await Promise.all([
+        getCountFromServer(qAll),
+        getCountFromServer(qDraft),
+        getCountFromServer(qCompleted),
+        getCountFromServer(qReceived),
+        getCountFromServer(qArchived),
+        getCountFromServer(qUnassigned)
+      ]);
+
+      setTabCounts({
+        all: resAll.data().count,
+        draft: resDraft.data().count,
+        completed: resCompleted.data().count,
+        received: resReceived.data().count,
+        archived: resArchived.data().count,
+        unassigned: resUnassigned.data().count
+      });
+      lastCountsFetchRef.current = Date.now();
+    } catch (e) {
+      console.warn('Error fetching tab counts from server:', e);
+    }
+  };
+
+  useEffect(() => {
+    if (currentUser?.role === 'admin' && isAuthReady) {
+      fetchTabCounts();
+    }
+  }, [currentUser?.id, currentUser?.role, currentUser?.email, isAuthReady]);
+
+  // Constructor de filtros Firestore para el administrador
+  const buildAdminConstraints = (filter: string, searchWord?: string) => {
+    const constraints: any[] = [where('adminEmail', '==', currentUser!.email)];
+    switch (filter) {
+      case 'draft':
+        constraints.push(where('status', '==', 'draft'));
+        break;
+      case 'completed':
+        constraints.push(where('status', '==', 'completed'));
+        break;
+      case 'received':
+        constraints.push(where('isReceived', '==', true));
+        break;
+      case 'archived':
+        constraints.push(where('status', '==', 'archived'));
+        break;
+      case 'unassigned':
+        constraints.push(
+          where('status', '==', 'completed'),
+          where('isReceived', '==', false),
+          where('isAssigned', '==', false)
+        );
+        break;
+      case 'all':
+      default:
+        break;
+    }
+    if (searchWord) {
+      constraints.push(where('searchTokens', 'array-contains', searchWord));
+    }
+    constraints.push(orderBy('updatedAt', 'desc'));
+    return constraints;
+  };
+
+  // Cargar páginas adicionales (>30) para el administrador con getDocs + startAfter
+  const handleLoadMore = async () => {
+    if (!currentUser || currentUser.role !== 'admin' || !lastVisibleDoc || isLoadingMore || !hasMorePages) return;
+    setIsLoadingMore(true);
+    try {
+      const searchWords = normalizeText(debouncedSearchTerm).split(/\s+/).filter(w => w.length >= 2);
+      const firstSearchWord = searchWords.length > 0 ? searchWords[0] : undefined;
+
+      const nextQ = query(
+        collection(db, 'inventories'),
+        ...buildAdminConstraints(statusFilter, firstSearchWord),
+        startAfter(lastVisibleDoc),
+        limit(30)
+      );
+      const snap = await getDocs(nextQ);
+      const newDocs = snap.docs.map(d => ({ id: d.id, ...d.data() } as Inventory));
+      
+      setAdminExtraPages(prev => {
+        const map = new Map<string, Inventory>();
+        prev.forEach(item => map.set(item.id, item));
+        newDocs.forEach(item => map.set(item.id, item));
+        return Array.from(map.values());
+      });
+
+      setLastVisibleDoc(snap.docs[snap.docs.length - 1] || null);
+      setHasMorePages(snap.docs.length === 30);
+    } catch (e) {
+      console.error('Error loading more inventories:', e);
+      showNotify('Error al cargar más inventarios', 'error');
+    } finally {
+      setIsLoadingMore(false);
+    }
+  };
+
+  // Firestore Listener for Inventories (Admin: Página 1 con onSnapshot; Dependiente: 3 consultas específicas)
+  useEffect(() => {
+    if (!currentUser || !isAuthReady) {
+      setInventories([]);
+      setAdminLivePage([]);
+      setAdminExtraPages([]);
+      setLastVisibleDoc(null);
+      setHasMorePages(false);
+      return;
+    }
+
+    if (currentUser.role === 'admin') {
+      // Al cambiar de pestaña o término de búsqueda, se reinicia la paginación
+      setAdminExtraPages([]);
+      setLastVisibleDoc(null);
+      setHasMorePages(false);
+
+      const searchWords = normalizeText(debouncedSearchTerm).split(/\s+/).filter(w => w.length >= 2);
+      const firstSearchWord = searchWords.length > 0 ? searchWords[0] : undefined;
+
+      const qPage1 = query(
+        collection(db, 'inventories'),
+        ...buildAdminConstraints(statusFilter, firstSearchWord),
+        limit(30)
+      );
+
+      const unsubscribe = onSnapshot(qPage1, (snapshot) => {
+        setIsReadingFromCache(snapshot.metadata.fromCache);
         const data = snapshot.docs.map(doc => ({
           id: doc.id,
           ...doc.data()
         })) as Inventory[];
-        PhotoSyncEngine.getInstance().setPersistedInventories(data.map(d => d.id));
-        setInventories(data);
-        setRawDependentInventories([]);
+        setAdminLivePage(data);
+
+        setLastVisibleDoc(snapshot.docs[snapshot.docs.length - 1] || null);
+        setHasMorePages(snapshot.docs.length === 30);
       }, (error) => {
         handleFirestoreError(error, OperationType.LIST, 'inventories');
       });
 
       return unsubscribe;
     } else {
-      let createdList: Inventory[] = [];
+      let draftsList: Inventory[] = [];
       let assignedList: Inventory[] = [];
+      let completedGraceList: Inventory[] = [];
 
       const updateMergedList = () => {
-        // PhotoSyncEngine.getInstance().setPersistedInventories debe recibir TODOS los ids, incluidos los ocultos
-        const allIds = Array.from(new Set([...createdList.map(d => d.id), ...assignedList.map(d => d.id)]));
+        const allIds = Array.from(new Set([
+          ...draftsList.map(d => d.id),
+          ...assignedList.map(d => d.id),
+          ...completedGraceList.map(d => d.id)
+        ]));
         PhotoSyncEngine.getInstance().setPersistedInventories(allIds);
 
-        // Unir sin duplicados
         const map = new Map<string, Inventory>();
-        for (const inv of createdList) {
-          map.set(inv.id, inv);
-        }
-        for (const inv of assignedList) {
-          map.set(inv.id, inv);
-        }
+        for (const inv of draftsList) map.set(inv.id, inv);
+        for (const inv of assignedList) map.set(inv.id, inv);
+        for (const inv of completedGraceList) map.set(inv.id, inv);
 
         const combined = Array.from(map.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
         setRawDependentInventories(combined);
       };
 
-      const qCreated = query(
-        collection(db, 'inventories'), 
+      // (a) createdBy == uid y status == 'draft'
+      const qDrafts = query(
+        collection(db, 'inventories'),
         where('createdBy', '==', currentUser.id),
-        orderBy('updatedAt', 'desc'),
-        limit(100)
+        where('status', '==', 'draft')
       );
 
+      // (b) assignedTo == uid
       const qAssigned = query(
-        collection(db, 'inventories'), 
-        where('assignedTo', '==', currentUser.id),
-        limit(100)
+        collection(db, 'inventories'),
+        where('assignedTo', '==', currentUser.id)
       );
 
-      const unsubCreated = onSnapshot(qCreated, (snapshot) => {
-        createdList = snapshot.docs.map(doc => ({
-          id: doc.id,
-          ...doc.data()
-        })) as Inventory[];
+      // (c) createdBy == uid, status == 'completed' y completedAt > ahora - GRACE_MS
+      const qGrace = query(
+        collection(db, 'inventories'),
+        where('createdBy', '==', currentUser.id),
+        where('status', '==', 'completed'),
+        where('completedAt', '>', currentTime - GRACE_MS)
+      );
+
+      const unsubDrafts = onSnapshot(qDrafts, (snapshot) => {
+        setIsReadingFromCache(snapshot.metadata.fromCache);
+        draftsList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Inventory));
         updateMergedList();
       }, (error) => {
         handleFirestoreError(error, OperationType.LIST, 'inventories');
       });
 
       const unsubAssigned = onSnapshot(qAssigned, (snapshot) => {
-        assignedList = snapshot.docs.map(doc => ({
-          id: doc.id,
-          ...doc.data()
-        })) as Inventory[];
+        setIsReadingFromCache(snapshot.metadata.fromCache);
+        assignedList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Inventory));
+        updateMergedList();
+      }, (error) => {
+        handleFirestoreError(error, OperationType.LIST, 'inventories');
+      });
+
+      const unsubGrace = onSnapshot(qGrace, (snapshot) => {
+        setIsReadingFromCache(snapshot.metadata.fromCache);
+        completedGraceList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Inventory));
         updateMergedList();
       }, (error) => {
         handleFirestoreError(error, OperationType.LIST, 'inventories');
       });
 
       return () => {
-        unsubCreated();
+        unsubDrafts();
         unsubAssigned();
+        unsubGrace();
       };
     }
-  }, [currentUser?.id, currentUser?.email, currentUser?.role, isAuthReady]);
+  }, [currentUser?.id, currentUser?.email, currentUser?.role, statusFilter, debouncedSearchTerm, isAuthReady]);
 
-  // Calcula el estado visible inventories para el rol dependent aplicando isVisibleToDependent
-  // La ventana de 48h expira cada 60s al cambiar currentTime sin recrear los listeners de Firestore
+  // Admin: Combina página 1 (live) y páginas extras, aplicando filtrado cliente para palabras adicionales si multi-término
+  useEffect(() => {
+    if (currentUser?.role === 'admin') {
+      const map = new Map<string, Inventory>();
+      for (const inv of adminLivePage) {
+        map.set(inv.id, inv);
+      }
+      for (const inv of adminExtraPages) {
+        map.set(inv.id, inv);
+      }
+      let combined = Array.from(map.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+
+      const searchWords = normalizeText(debouncedSearchTerm).split(/\s+/).filter(w => w.length >= 2);
+      if (searchWords.length > 1) {
+        const restWords = searchWords.slice(1);
+        combined = combined.filter(inv => {
+          return restWords.every(w => {
+            const inTokens = inv.searchTokens?.some(t => t.startsWith(w) || t.includes(w));
+            if (inTokens) return true;
+            const fullText = normalizeText(`${inv.propertyName || ''} ${inv.address || ''} ${inv.internalCode || ''} ${inv.ownerName || ''} ${inv.tenantName || ''}`);
+            return fullText.includes(w);
+          });
+        });
+      }
+
+      setInventories(combined);
+      PhotoSyncEngine.getInstance().setPersistedInventories(combined.map(d => d.id));
+    }
+  }, [adminLivePage, adminExtraPages, debouncedSearchTerm, currentUser?.role]);
+
+  // Dependiente: Calcula inventarios visibles aplicando isVisibleToDependent y filtro de búsqueda cliente si aplica
   useEffect(() => {
     if (currentUser?.role === 'dependent') {
-      const visible = rawDependentInventories.filter(inv => 
+      let visible = rawDependentInventories.filter(inv => 
         isVisibleToDependent(inv, currentUser.id, currentTime)
       );
+
+      const searchWords = normalizeText(debouncedSearchTerm).split(/\s+/).filter(w => w.length >= 2);
+      if (searchWords.length > 0) {
+        visible = visible.filter(inv => {
+          return searchWords.every(w => {
+            const inTokens = inv.searchTokens?.some(t => t.startsWith(w) || t.includes(w));
+            if (inTokens) return true;
+            const fullText = normalizeText(`${inv.propertyName || ''} ${inv.address || ''} ${inv.internalCode || ''} ${inv.ownerName || ''} ${inv.tenantName || ''}`);
+            return fullText.includes(w);
+          });
+        });
+      }
+
       setInventories(visible);
     }
-  }, [rawDependentInventories, currentTime, currentUser?.id, currentUser?.role]);
+  }, [rawDependentInventories, currentTime, debouncedSearchTerm, currentUser?.id, currentUser?.role]);
 
   const getPhotoDataForZip = async (photo: Photo): Promise<{ type: 'blob', blob: Blob } | { type: 'base64', data: string } | null> => {
     if (photo.localBlobId) {
@@ -1909,20 +2141,35 @@ export default function App() {
       
       // Check for internalCode uniqueness among non-archived inventories (only if provided and not empty)
       if (data.internalCode && typeof data.internalCode === 'string' && data.internalCode.trim() !== '') {
-        const duplicate = inventories.find(i => 
-          i.id !== inventoryId && 
-          i.internalCode === data.internalCode.trim() && 
-          i.status !== 'archived'
+        const trimmedCode = data.internalCode.trim();
+        const codeQuery = query(
+          collection(db, 'inventories'),
+          where('adminEmail', '==', effectiveAdminEmail),
+          where('internalCode', '==', trimmedCode),
+          limit(5)
         );
+        const codeSnap = await getDocs(codeQuery);
+        const duplicate = codeSnap.docs.find(d => d.id !== inventoryId && d.data().status !== 'archived');
         
         if (duplicate) {
-          showNotify(`El código interno "${data.internalCode}" ya está en uso por un inventario activo (${duplicate.propertyName}). Archívelo o elimínelo para reutilizar el código.`, 'error');
+          const dupData = duplicate.data();
+          showNotify(`El código interno "${trimmedCode}" ya está en uso por un inventario activo (${dupData.propertyName || 'Inmueble'}). Archívelo o elimínelo para reutilizar el código.`, 'error');
           return false;
         }
       }
 
       const inventoryRef = doc(db, 'inventories', inventoryId);
-      const existingInventory = inventories.find(i => i.id === inventoryId);
+      let existingInventory = inventories.find(i => i.id === inventoryId);
+      if (!existingInventory && inventoryId) {
+        try {
+          const snap = await getDoc(inventoryRef);
+          if (snap.exists()) {
+            existingInventory = { id: snap.id, ...snap.data() } as Inventory;
+          }
+        } catch (e) {
+          console.warn('Could not read existing doc from server:', e);
+        }
+      }
 
       // Calcular conteo total conocido de fotos para photoCount (Requirement 1 & 2)
       const knownSpacePhotosCount = (cleanInventory.spaces || []).reduce((acc: number, s: any) => {
@@ -2035,6 +2282,9 @@ export default function App() {
         console.warn('[SyncEngine] Error en background triggerSync:', err);
       });
       
+      updateLocalInventory({ ...cleanInventory, ...data, id: inventoryId });
+      fetchTabCounts(true);
+
       showNotify('Inventario guardado correctamente', 'success');
       return true;
     } catch (error) {
@@ -2420,7 +2670,17 @@ export default function App() {
       navigateTo('settings');
       return;
     }
-    const inventory = inventories.find(i => i.id === id);
+    let inventory = inventories.find(i => i.id === id);
+    if (!inventory) {
+      try {
+        const snap = await getDoc(doc(db, 'inventories', id));
+        if (snap.exists()) {
+          inventory = { id: snap.id, ...snap.data() } as Inventory;
+        }
+      } catch (e) {
+        console.error('Error fetching inventory to delete:', e);
+      }
+    }
     if (!inventory) return;
 
     if (currentUser?.role === 'dependent' && inventory.createdBy === currentUser.id && inventory.status === 'completed' && inventory.assignedTo !== currentUser.id) {
@@ -2438,6 +2698,10 @@ export default function App() {
           try {
             await deleteInventoryPhotos(inventory);
             await deleteDoc(doc(db, 'inventories', id));
+            setAdminLivePage(prev => prev.filter(i => i.id !== id));
+            setAdminExtraPages(prev => prev.filter(i => i.id !== id));
+            setInventories(prev => prev.filter(i => i.id !== id));
+            fetchTabCounts(true);
             showNotify('Inventario eliminado correctamente');
             if (currentInventory?.id === id) {
               setCurrentInventory(null);
@@ -2501,11 +2765,21 @@ export default function App() {
   const verifyAndDelete = async () => {
     if (deleteCodeInput === generatedDeleteCode && inventoryIdToDelete) {
       try {
-        const inventory = inventories.find(i => i.id === inventoryIdToDelete);
+        let inventory = inventories.find(i => i.id === inventoryIdToDelete);
+        if (!inventory) {
+          const snap = await getDoc(doc(db, 'inventories', inventoryIdToDelete));
+          if (snap.exists()) {
+            inventory = { id: snap.id, ...snap.data() } as Inventory;
+          }
+        }
         if (inventory) {
           await deleteInventoryPhotos(inventory);
         }
         await deleteDoc(doc(db, 'inventories', inventoryIdToDelete));
+        setAdminLivePage(prev => prev.filter(i => i.id !== inventoryIdToDelete));
+        setAdminExtraPages(prev => prev.filter(i => i.id !== inventoryIdToDelete));
+        setInventories(prev => prev.filter(i => i.id !== inventoryIdToDelete));
+        fetchTabCounts(true);
         showNotify('Inventario eliminado correctamente');
         setShowDeleteCodeModal(false);
         setInventoryIdToDelete(null);
@@ -2617,7 +2891,7 @@ export default function App() {
         }
 
         try {
-          await batch.commit();
+          await (batch.commit());
           totalProcessed += docsInBatch.length;
         } catch (batchErr: any) {
           console.warn('Batch commit falló durante optimización, reintentando uno a uno:', batchErr);
@@ -2737,6 +3011,17 @@ export default function App() {
         })
       });
 
+      updateLocalInventory({
+        ...latestInv,
+        assignedTo: dep.id,
+        assignedToName: fullName,
+        assignedAt: now,
+        assignedBy: currentUser.id,
+        isAssigned: true,
+        updatedAt: now
+      });
+      fetchTabCounts(true);
+
       showNotify(`Inventario asignado a ${fullName}`, 'success');
       setShowAssignModal(false);
       setAssigningInventory(null);
@@ -2780,6 +3065,15 @@ export default function App() {
         })
       });
 
+      updateLocalInventory({
+        ...latestInv,
+        assignedTo: null,
+        assignedToName: null,
+        isAssigned: false,
+        updatedAt: now
+      });
+      fetchTabCounts(true);
+
       showNotify('Asignación eliminada correctamente', 'success');
       setShowAssignModal(false);
       setAssigningInventory(null);
@@ -2793,7 +3087,17 @@ export default function App() {
   };
 
   const handleArchiveInventory = async (id: string) => {
-    const inventoryToArchive = inventories.find(i => i.id === id);
+    let inventoryToArchive = inventories.find(i => i.id === id);
+    if (!inventoryToArchive) {
+      try {
+        const snap = await getDoc(doc(db, 'inventories', id));
+        if (snap.exists()) {
+          inventoryToArchive = { id: snap.id, ...snap.data() } as Inventory;
+        }
+      } catch (e) {
+        console.error('Error fetching inventory to archive:', e);
+      }
+    }
     if (!inventoryToArchive) return;
 
     if (currentUser?.role === 'dependent' && inventoryToArchive.createdBy === currentUser.id && inventoryToArchive.status === 'completed' && inventoryToArchive.assignedTo !== currentUser.id) {
@@ -2802,9 +3106,25 @@ export default function App() {
     }
 
     const internalCode = inventoryToArchive.internalCode;
-    const existingArchivedList = internalCode 
-      ? inventories.filter(i => i.status === 'archived' && i.internalCode === internalCode)
-      : [];
+    const effectiveAdminEmail = inventoryToArchive.adminEmail || resolveAdminEmail(currentUser);
+    let existingArchivedList: Inventory[] = [];
+
+    if (internalCode && effectiveAdminEmail) {
+      try {
+        const archivedQ = query(
+          collection(db, 'inventories'),
+          where('adminEmail', '==', effectiveAdminEmail),
+          where('internalCode', '==', internalCode),
+          where('status', '==', 'archived')
+        );
+        const snap = await getDocs(archivedQ);
+        existingArchivedList = snap.docs
+          .filter(d => d.id !== id)
+          .map(d => ({ id: d.id, ...d.data() } as Inventory));
+      } catch (err) {
+        console.warn('Error querying archived duplicates from server:', err);
+      }
+    }
 
     const title = 'Archivar Inventario';
     const message = existingArchivedList.length > 0
@@ -2821,7 +3141,13 @@ export default function App() {
             await deleteInventoryPhotos(oldInv);
             await deleteDoc(doc(db, 'inventories', oldInv.id));
           }
-          await updateDoc(doc(db, 'inventories', id), { status: 'archived' });
+          const now = Date.now();
+          await updateDoc(doc(db, 'inventories', id), { 
+            status: 'archived',
+            updatedAt: now 
+          });
+          updateLocalInventory({ ...inventoryToArchive!, status: 'archived', updatedAt: now });
+          fetchTabCounts(true);
           showNotify(existingArchivedList.length > 0 ? 'Inventario archivado y versión anterior eliminada' : 'Inventario archivado correctamente');
         } catch (error) {
           handleFirestoreError(error, OperationType.UPDATE, `inventories/${id}`);
@@ -3368,9 +3694,8 @@ export default function App() {
 
       const finalInventory = { ...currentInventory, ...updateData };
       setCurrentInventory(finalInventory);
-      setInventories(prev => prev.map(inv => 
-        inv.id === currentInventory.id ? finalInventory : inv
-      ));
+      updateLocalInventory(finalInventory);
+      fetchTabCounts(true);
 
       // Despachar copia legal en PDF por correo electrónico
       try {
@@ -4005,45 +4330,119 @@ export default function App() {
   }, [currentUser?.role, statusFilter]);
 
   const filteredInventories = React.useMemo(() => {
-    return inventories
-      .filter(inv => {
-        const matchesSearch = inv.propertyName.toLowerCase().includes(searchTerm.toLowerCase()) ||
-                             inv.address.toLowerCase().includes(searchTerm.toLowerCase()) ||
-                             (inv.internalCode && inv.internalCode.toLowerCase().includes(searchTerm.toLowerCase())) ||
-                             (inv.ownerName && inv.ownerName.toLowerCase().includes(searchTerm.toLowerCase())) ||
-                             (inv.tenantName && inv.tenantName.toLowerCase().includes(searchTerm.toLowerCase()));
-        
-        let matchesStatus = true;
-        if (currentUser?.role === 'dependent' || statusFilter === 'all') {
-          matchesStatus = true;
-        } else if (statusFilter === 'unassigned') {
-          matchesStatus = isAssignable(inv) && !inv.assignedTo;
-        } else if (statusFilter === 'received') {
-          matchesStatus = !!(inv.tenantReceiveSignature || inv.ownerDeliverySignature);
-        } else {
-          matchesStatus = inv.status === statusFilter;
-        }
-        return matchesSearch && matchesStatus;
-      })
-      .sort((a, b) => {
-        if (currentUser?.role === 'dependent') {
-          // 1) Asignados a él pendientes de recibir
-          // 2) Sus borradores
-          // 3) Solo consulta
-          // Dentro de cada grupo por updatedAt descendente
-          const getGroup = (inv: Inventory) => {
-            if (inv.assignedTo === currentUser.id) return 1;
-            if (inv.createdBy === currentUser.id && inv.status === 'draft') return 2;
-            return 3;
-          };
-          const gA = getGroup(a);
-          const gB = getGroup(b);
-          if (gA !== gB) return gA - gB;
-          return (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0);
-        }
-        return b.createdAt - a.createdAt;
+    if (currentUser?.role === 'dependent') {
+      return [...inventories].sort((a, b) => {
+        const getGroup = (inv: Inventory) => {
+          if (inv.assignedTo === currentUser.id) return 1;
+          if (inv.createdBy === currentUser.id && inv.status === 'draft') return 2;
+          return 3;
+        };
+        const gA = getGroup(a);
+        const gB = getGroup(b);
+        if (gA !== gB) return gA - gB;
+        return (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0);
       });
-  }, [inventories, searchTerm, statusFilter, currentUser]);
+    }
+    return inventories;
+  }, [inventories, currentUser]);
+
+  // Carga contadores de inventarios para cada dependiente con getCountFromServer
+  useEffect(() => {
+    if (!currentUser || currentUser.role !== 'admin' || dependents.length === 0) return;
+    if (!navigator.onLine) return;
+
+    let isMounted = true;
+    const loadDependentCounts = async () => {
+      const countsMap: Record<string, number> = {};
+      await Promise.all(
+        dependents.map(async (dep) => {
+          try {
+            const qCreated = query(collection(db, 'inventories'), where('createdBy', '==', dep.id));
+            const qAssigned = query(collection(db, 'inventories'), where('assignedTo', '==', dep.id));
+            const [snapCreated, snapAssigned] = await Promise.all([
+              getCountFromServer(qCreated),
+              getCountFromServer(qAssigned)
+            ]);
+            countsMap[dep.id] = snapCreated.data().count + snapAssigned.data().count;
+          } catch (e) {
+            console.warn(`Error getting count for dependent ${dep.id}:`, e);
+          }
+        })
+      );
+      if (isMounted) {
+        setDependentCounts(prev => ({ ...prev, ...countsMap }));
+      }
+    };
+
+    loadDependentCounts();
+    return () => { isMounted = false; };
+  }, [dependents, currentUser?.id, currentUser?.role]);
+
+  // Carga bajo demanda el historial de inventarios del dependiente seleccionado (páginas de 30) y su contador
+  useEffect(() => {
+    if (!selectedDependentForInventories) {
+      setDependentModalInvs([]);
+      setDependentModalCount(null);
+      setDependentModalHasMore(false);
+      return;
+    }
+
+    let isMounted = true;
+    const depId = selectedDependentForInventories.id;
+
+    const loadModalData = async () => {
+      setDependentModalLoading(true);
+      try {
+        const qCreatedCount = query(collection(db, 'inventories'), where('createdBy', '==', depId));
+        const qAssignedCount = query(collection(db, 'inventories'), where('assignedTo', '==', depId));
+
+        const qCreatedDocs = query(
+          collection(db, 'inventories'),
+          where('createdBy', '==', depId),
+          orderBy('updatedAt', 'desc'),
+          limit(30)
+        );
+        const qAssignedDocs = query(
+          collection(db, 'inventories'),
+          where('assignedTo', '==', depId),
+          orderBy('updatedAt', 'desc'),
+          limit(30)
+        );
+
+        const [cCreated, cAssigned, docsCreated, docsAssigned] = await Promise.all([
+          getCountFromServer(qCreatedCount).catch(() => null),
+          getCountFromServer(qAssignedCount).catch(() => null),
+          getDocs(qCreatedDocs).catch(() => null),
+          getDocs(qAssignedDocs).catch(() => null)
+        ]);
+
+        if (!isMounted) return;
+
+        if (cCreated && cAssigned) {
+          setDependentModalCount(cCreated.data().count + cAssigned.data().count);
+        }
+
+        const map = new Map<string, Inventory>();
+        if (docsCreated) {
+          docsCreated.docs.forEach(d => map.set(d.id, { id: d.id, ...d.data() } as Inventory));
+        }
+        if (docsAssigned) {
+          docsAssigned.docs.forEach(d => map.set(d.id, { id: d.id, ...d.data() } as Inventory));
+        }
+
+        const combined = Array.from(map.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+        setDependentModalInvs(combined.slice(0, 30));
+        setDependentModalHasMore(combined.length >= 30);
+      } catch (err) {
+        console.error('Error loading dependent modal inventories:', err);
+      } finally {
+        if (isMounted) setDependentModalLoading(false);
+      }
+    };
+
+    loadModalData();
+    return () => { isMounted = false; };
+  }, [selectedDependentForInventories]);
 
   const handleLogout = async () => {
     confirmAction(
@@ -4219,7 +4618,9 @@ export default function App() {
                     {selectedDependentForInventories.firstName?.[0]}{selectedDependentForInventories.lastName?.[0]}
                   </div>
                   <div>
-                    <h2 className="text-2xl font-bold tracking-tight">Inventarios de {selectedDependentForInventories.firstName}</h2>
+                    <h2 className="text-2xl font-bold tracking-tight">
+                      Inventarios de {selectedDependentForInventories.firstName} {dependentModalCount !== null ? `(${dependentModalCount})` : ''}
+                    </h2>
                     <p className="text-muted text-sm font-medium">{selectedDependentForInventories.email}</p>
                   </div>
                 </div>
@@ -4233,24 +4634,23 @@ export default function App() {
 
               {/* Modal Content */}
               <div className="flex-1 overflow-y-auto p-8">
-                {(() => {
-                  const dependentInventories = inventories.filter(inv => (inv.assignedTo || inv.createdBy) === selectedDependentForInventories.id);
-                  
-                  if (dependentInventories.length === 0) {
-                    return (
-                      <div className="flex flex-col items-center justify-center py-20 text-center">
-                        <div className="w-20 h-20 bg-black/5 rounded-full flex items-center justify-center mb-6 text-black/20">
-                          <ClipboardList size={40} />
-                        </div>
-                        <h3 className="text-xl font-bold mb-2">Sin inventarios</h3>
-                        <p className="text-muted max-w-xs mx-auto">Este dependiente aún no ha realizado ningún inventario.</p>
-                      </div>
-                    );
-                  }
-
-                  return (
+                {dependentModalLoading ? (
+                  <div className="flex flex-col items-center justify-center py-20 text-center">
+                    <div className="w-8 h-8 border-2 border-black/40 border-t-transparent rounded-full animate-spin mb-4" />
+                    <p className="text-muted text-sm font-medium">Cargando inventarios del dependiente...</p>
+                  </div>
+                ) : dependentModalInvs.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center py-20 text-center">
+                    <div className="w-20 h-20 bg-black/5 rounded-full flex items-center justify-center mb-6 text-black/20">
+                      <ClipboardList size={40} />
+                    </div>
+                    <h3 className="text-xl font-bold mb-2">Sin inventarios</h3>
+                    <p className="text-muted max-w-xs mx-auto">Este dependiente aún no tiene inventarios registrados ni asignados.</p>
+                  </div>
+                ) : (
+                  <div className="space-y-6">
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                      {dependentInventories.map((inv) => (
+                      {dependentModalInvs.map((inv) => (
                         <div 
                           key={inv.id}
                           className="bg-white rounded-3xl p-6 border border-black/5 shadow-sm hover:shadow-xl hover:shadow-black/5 transition-all group cursor-pointer"
@@ -4284,7 +4684,7 @@ export default function App() {
                             {inv.propertyName}
                           </h3>
                           <p className="text-xs text-muted font-medium mb-4 line-clamp-1">
-                            {inv.propertyAddress}
+                            {inv.propertyAddress || inv.address}
                           </p>
                           
                           <div className="pt-4 border-t border-black/5 flex items-center justify-between">
@@ -4304,8 +4704,8 @@ export default function App() {
                         </div>
                       ))}
                     </div>
-                  );
-                })()}
+                  </div>
+                )}
               </div>
             </motion.div>
           </div>
@@ -5287,10 +5687,10 @@ export default function App() {
         </header>
 
         {/* Offline indicator banner */}
-        {!isOnline && (
+        {(!isOnline || isReadingFromCache) && (
           <div className="bg-amber-500 text-white px-4 py-2 text-center text-xs font-bold flex items-center justify-center gap-2 shadow-inner">
             <WifiOff size={14} className="shrink-0" />
-            <span>Modo Sin Conexión (Offline) — Los datos se guardan en el teléfono y se sincronizarán al reconectar</span>
+            <span>Mostrando datos guardados en el teléfono</span>
           </div>
         )}
 
@@ -5371,14 +5771,13 @@ export default function App() {
                   {currentUser?.role === 'admin' && (
                     <div className="flex bg-white p-1 rounded-2xl border border-black/5 mb-3 overflow-x-auto no-scrollbar shadow-sm gap-1">
                       {(() => {
-                        const unassignedCount = inventories.filter(i => isAssignable(i) && !i.assignedTo).length;
                         const tabs = [
-                          { key: 'all' as const, label: 'Todos', count: inventories.length, highlight: false },
-                          { key: 'draft' as const, label: 'Borradores', count: inventories.filter(i => i.status === 'draft').length, highlight: false },
-                          { key: 'completed' as const, label: 'Listos', count: inventories.filter(i => i.status === 'completed').length, highlight: false },
-                          { key: 'unassigned' as const, label: 'Firmados sin asignar', count: unassignedCount, highlight: unassignedCount > 0 },
-                          { key: 'received' as const, label: 'Recibidos', count: inventories.filter(i => !!(i.tenantReceiveSignature || i.ownerDeliverySignature)).length, highlight: false },
-                          { key: 'archived' as const, label: 'Archivados', count: inventories.filter(i => i.status === 'archived').length, highlight: false }
+                          { key: 'all' as const, label: 'Todos', count: tabCounts ? tabCounts.all : (isOnline ? '...' : '-'), highlight: false },
+                          { key: 'draft' as const, label: 'Borradores', count: tabCounts ? tabCounts.draft : (isOnline ? '...' : '-'), highlight: false },
+                          { key: 'completed' as const, label: 'Listos', count: tabCounts ? tabCounts.completed : (isOnline ? '...' : '-'), highlight: false },
+                          { key: 'unassigned' as const, label: 'Firmados sin asignar', count: tabCounts ? tabCounts.unassigned : (isOnline ? '...' : '-'), highlight: (tabCounts?.unassigned || 0) > 0 },
+                          { key: 'received' as const, label: 'Recibidos', count: tabCounts ? tabCounts.received : (isOnline ? '...' : '-'), highlight: false },
+                          { key: 'archived' as const, label: 'Archivados', count: tabCounts ? tabCounts.archived : (isOnline ? '...' : '-'), highlight: false }
                         ];
                         return tabs.map((tab) => {
                           const isActive = statusFilter === tab.key;
@@ -5450,7 +5849,9 @@ export default function App() {
                   </div>
                   <div>
                     <h3 className="text-2xl font-bold">
-                      {currentUser?.role === 'dependent' && !searchTerm
+                      {searchTerm
+                        ? 'Sin resultados'
+                        : currentUser?.role === 'dependent'
                         ? 'No tienes inventarios en curso.'
                         : statusFilter === 'received' 
                           ? 'No hay inventarios recibidos' 
@@ -5502,7 +5903,8 @@ export default function App() {
                   </div>
                 </div>
               ) : (
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                <>
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                   {filteredInventories.map((inv, index) => (
                     <motion.div 
                       key={inv.id}
@@ -5527,7 +5929,7 @@ export default function App() {
                         <div className="flex justify-between items-start mb-6">
                           <div className="flex flex-wrap gap-2 items-center">
                             <div className="bg-black/5 px-3 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-wider text-black/60">
-                              {typeof inv.photoCount === 'number' ? inv.photoCount : inv.spaces.reduce((acc, s) => acc + (s.photos?.length || 0), 0)} Fotos
+                              {typeof inv.photoCount === 'number' ? inv.photoCount : 0} Fotos
                             </div>
                             {currentUser?.role === 'dependent' ? (
                               inv.assignedTo === currentUser.id ? (
@@ -5795,7 +6197,28 @@ export default function App() {
                       </div>
                     </motion.div>
                   ))}
-                </div>
+                  </div>
+
+                  {/* Botón Cargar más para paginación de administrador */}
+                  {currentUser?.role === 'admin' && hasMorePages && (
+                    <div className="flex justify-center pt-4 pb-2">
+                      <button
+                        onClick={handleLoadMore}
+                        disabled={isLoadingMore}
+                        className="bg-black/5 hover:bg-black/10 active:scale-95 text-black px-6 py-3 rounded-2xl text-xs font-bold transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                      >
+                        {isLoadingMore ? (
+                          <>
+                            <div className="w-3.5 h-3.5 border-2 border-black/40 border-t-transparent rounded-full animate-spin" />
+                            <span>Cargando más...</span>
+                          </>
+                        ) : (
+                          <span>Cargar más inventarios</span>
+                        )}
+                      </button>
+                    </div>
+                  )}
+                </>
               )}
             </motion.div>
           )}
@@ -6890,7 +7313,7 @@ export default function App() {
                         <div className="pt-6 border-t border-black/5 flex items-center justify-between">
                           <div className="flex flex-col">
                             <span className="text-[10px] font-bold uppercase tracking-widest text-muted">Inventarios</span>
-                            <span className="text-xl font-bold">{inventories.filter(i => (i.assignedTo || i.createdBy) === dep.id).length}</span>
+                            <span className="text-xl font-bold">{dependentCounts[dep.id] !== undefined ? dependentCounts[dep.id] : (isOnline ? '...' : '-')}</span>
                           </div>
                           <div className="w-10 h-10 bg-emerald-50 text-emerald-600 rounded-xl flex items-center justify-center">
                             <ClipboardList size={20} />
