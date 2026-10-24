@@ -1,3 +1,4 @@
+/* android-patched */
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -78,6 +79,7 @@ import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import JSZip from 'jszip';
 import { saveAs } from 'file-saver';
+import { isNative, nativeListen, saveZip, savePdf, fetchBlob, webOrigin } from './native';
 import { Inventory, InventorySpace, InventoryItem, Photo, User, Annex, InventoryTemplate, TemplateSpace, PropertyType, License, OfflinePhotoRecord, SUPER_ADMIN_EMAIL, InventoryPhotoDoc } from './types';
 import { SignaturePad } from './components/SignaturePad';
 import { Auth } from './components/Auth';
@@ -110,21 +112,37 @@ import {
   getDoc,
   getDocs,
   addDoc, 
-  updateDoc, 
-  deleteDoc, 
   doc, 
   query,
   where,
   orderBy,
   limit,
-  setDoc,
   writeBatch,
   getDocFromServer,
   arrayUnion,
   startAfter,
   getCountFromServer,
-  DocumentSnapshot
+  DocumentSnapshot,
+  getDocFromCache,
+  getDocsFromCache
 } from 'firebase/firestore';
+import { setDoc, updateDoc, deleteDoc, queuedWrite } from './offlineWrites';
+import { 
+  isFirestoreQuotaError, 
+  isStorageQuotaError, 
+  isQuotaError, 
+  isFirestoreCircuitBreakerActive, 
+  isStorageCircuitBreakerActive, 
+  tripFirestoreCircuitBreaker, 
+  tripStorageCircuitBreaker, 
+  resetFirestoreCircuitBreaker, 
+  resetStorageCircuitBreaker, 
+  onFirestoreCircuitBreakerChange, 
+  onStorageCircuitBreakerChange 
+} from './lib/quotaCircuitBreaker';
+import { SyncStatusChip } from './components/SyncStatusChip';
+import { SyncStatusSheet } from './components/SyncStatusSheet';
+import { CriticalBlockingBanner } from './components/CriticalBlockingBanner';
 import { buildSearchTokens, computeIsReceived, computeIsAssigned, normalizeText } from './lib/searchTokens';
 import { ref, uploadBytesResumable, getDownloadURL, deleteObject } from 'firebase/storage';
 import ReactQuill from 'react-quill-new';
@@ -412,7 +430,38 @@ export default function App() {
   const [pendingLocalPhotos, setPendingLocalPhotos] = useState<OfflinePhotoRecord[]>([]);
   const [globalPendingPhotos, setGlobalPendingPhotos] = useState<OfflinePhotoRecord[]>([]);
   const [isRetryingSync, setIsRetryingSync] = useState(false);
+  const [authQuotaErrorMessage, setAuthQuotaErrorMessage] = useState<string | null>(null);
+  const [isLimitedMode, setIsLimitedMode] = useState<boolean>(false);
+  const [circuitBreakerEpoch, setCircuitBreakerEpoch] = useState<number>(0);
   const [expandedGalleries, setExpandedGalleries] = useState<Record<string, boolean>>({});
+  const [isSyncStatusSheetOpen, setIsSyncStatusSheetOpen] = useState(false);
+  const [isSyncingPhotos, setIsSyncingPhotos] = useState(false);
+  const [lastSyncAttemptTimestamp, setLastSyncAttemptTimestamp] = useState<number | null>(null);
+  const [lastSyncError, setLastSyncError] = useState<string | null>(null);
+  const [isFirestoreQuotaActive, setIsFirestoreQuotaActive] = useState<boolean>(isFirestoreCircuitBreakerActive());
+  const [isStorageQuotaActive, setIsStorageQuotaActive] = useState<boolean>(isStorageCircuitBreakerActive());
+  const [isBlockingBannerDismissed, setIsBlockingBannerDismissed] = useState(false);
+  const syncedPhotosCounterRef = useRef<number>(0);
+
+  // Sincronización reactiva del estado de los dos interruptores
+  useEffect(() => {
+    const unsubFirestore = onFirestoreCircuitBreakerChange((active) => {
+      setIsFirestoreQuotaActive(active);
+      if (!active) {
+        console.log('[App] Firestore circuit breaker desactivado tras enfriamiento. Reactivando listeners...');
+        setCircuitBreakerEpoch(prev => prev + 1);
+      }
+    });
+
+    const unsubStorage = onStorageCircuitBreakerChange((active) => {
+      setIsStorageQuotaActive(active);
+    });
+
+    return () => {
+      unsubFirestore();
+      unsubStorage();
+    };
+  }, []);
 
   const [showAssignModal, setShowAssignModal] = useState(false);
   const [assigningInventory, setAssigningInventory] = useState<Inventory | null>(null);
@@ -738,7 +787,7 @@ export default function App() {
         expiresAt: newExpirationIso
       });
 
-      await batch.commit();
+      await queuedWrite(batch.commit());
 
       setCurrentUser(prev => prev ? ({
         ...prev,
@@ -1001,8 +1050,9 @@ export default function App() {
     const errorMessage = error instanceof Error ? error.message : String(error);
     
     // Check for quota exceeded
-    if (errorMessage.toLowerCase().includes('quota exceeded') || errorMessage.toLowerCase().includes('quota limit exceeded')) {
-      showNotify('Límite de uso diario alcanzado (Quota Exceeded). El servicio se restablecerá mañana o puedes activar el plan Blaze en la consola de Firebase para eliminar este límite.', 'error');
+    if (isFirestoreQuotaError(error)) {
+      tripFirestoreCircuitBreaker(error);
+      showNotify('Límite diario de Firebase alcanzado: la app sigue guardando en el teléfono y sincronizará después', 'warning');
     } else {
       showNotify(`Error en Firestore (${operationType} en ${path || 'recurso'}): ${errorMessage}`, 'error');
     }
@@ -1093,17 +1143,41 @@ export default function App() {
         // Bypass verification for default admin
         setIsEmailVerified(updatedUser.emailVerified || updatedUser.email === SUPER_ADMIN_EMAIL);
         
-        let userDoc = await getDoc(doc(db, 'users', updatedUser.uid));
-        
-        // Retry if doc not found (to handle race condition during registration)
-        if (!userDoc.exists()) {
-          console.log('User doc not found, retrying in 2s...');
-          await new Promise(resolve => setTimeout(resolve, 2000));
+        let userDoc: DocumentSnapshot | null = null;
+        let isQuotaProblem = false;
+        let isCachedUser = false;
+
+        try {
           userDoc = await getDoc(doc(db, 'users', updatedUser.uid));
+          
+          // Retry if doc not found (to handle race condition during registration)
+          if (!userDoc.exists()) {
+            console.log('User doc not found, retrying in 2s...');
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            userDoc = await getDoc(doc(db, 'users', updatedUser.uid));
+          }
+        } catch (fetchErr: any) {
+          console.warn('Error fetching user document from server:', fetchErr);
+          if (isFirestoreQuotaError(fetchErr)) {
+            isQuotaProblem = true;
+            tripFirestoreCircuitBreaker(fetchErr);
+          }
+          // Intenta primero getDocFromCache(users/uid) y entra con ese perfil en modo limitado
+          try {
+            console.log('Intentando leer perfil de usuario desde caché local de Firestore...');
+            userDoc = await getDocFromCache(doc(db, 'users', updatedUser.uid));
+            if (userDoc.exists()) {
+              isCachedUser = true;
+              console.log('Perfil cargado desde caché local en modo limitado');
+            }
+          } catch (cacheErr) {
+            console.warn('No se pudo recuperar usuario desde caché local:', cacheErr);
+            userDoc = null;
+          }
         }
 
-        if (userDoc.exists()) {
-          console.log('User document found in Firestore:', userDoc.data());
+        if (userDoc && userDoc.exists()) {
+          console.log('User document found in Firestore:', userDoc.data(), isCachedUser ? '(desde caché)' : '');
           const userData = userDoc.data();
           if (userData.isDeleted) {
             await signOut(auth);
@@ -1122,25 +1196,27 @@ export default function App() {
 
           if (userData.role === 'dependent' && userData.adminEmail) {
             try {
-              const q = query(collection(db, 'users'), where('email', '==', userData.adminEmail), where('role', '==', 'admin'));
-              const querySnapshot = await getDocs(q);
-              if (!querySnapshot.empty) {
-                const adminDoc = querySnapshot.docs[0];
-                const adminData = adminDoc.data();
-                adminExpirationDate = adminData.expirationDate;
-                adminPlan = adminData.plan;
-                adminName = `${adminData.firstName} ${adminData.lastName}`.trim();
-                adminOwnerTemplate = adminData.ownerTemplate;
-                adminTenantTemplate = adminData.tenantTemplate;
-                adminAgencyLogo = adminData.agencyLogo;
-                adminAgencyName = adminData.agencyName;
-                if (!adminUid) {
-                  adminUid = adminDoc.id;
-                  // Save it to the user document for future use
-                  try {
-                    await updateDoc(doc(db, 'users', updatedUser.uid), { adminUid });
-                  } catch (updateErr) {
-                    console.error('Error updating user with adminUid:', updateErr);
+              if (!isFirestoreCircuitBreakerActive() && !isCachedUser) {
+                const q = query(collection(db, 'users'), where('email', '==', userData.adminEmail), where('role', '==', 'admin'));
+                const querySnapshot = await getDocs(q);
+                if (!querySnapshot.empty) {
+                  const adminDoc = querySnapshot.docs[0];
+                  const adminData = adminDoc.data();
+                  adminExpirationDate = adminData.expirationDate;
+                  adminPlan = adminData.plan;
+                  adminName = `${adminData.firstName} ${adminData.lastName}`.trim();
+                  adminOwnerTemplate = adminData.ownerTemplate;
+                  adminTenantTemplate = adminData.tenantTemplate;
+                  adminAgencyLogo = adminData.agencyLogo;
+                  adminAgencyName = adminData.agencyName;
+                  if (!adminUid) {
+                    adminUid = adminDoc.id;
+                    // Save it to the user document for future use
+                    try {
+                      await updateDoc(doc(db, 'users', updatedUser.uid), { adminUid });
+                    } catch (updateErr) {
+                      console.error('Error updating user with adminUid:', updateErr);
+                    }
                   }
                 }
               }
@@ -1161,6 +1237,10 @@ export default function App() {
             document.body.classList.remove('dark');
           }
           setIsDarkMode(resolvedDarkMode);
+
+          const limitedModeActive = isCachedUser || isQuotaProblem || isFirestoreCircuitBreakerActive();
+          setIsLimitedMode(limitedModeActive);
+          setAuthQuotaErrorMessage(null);
 
           const newUser = {
             id: updatedUser.uid,
@@ -1185,7 +1265,8 @@ export default function App() {
             isDarkMode: resolvedDarkMode,
             ownerTemplate: userData.role === 'admin' ? userData.ownerTemplate : adminOwnerTemplate,
             tenantTemplate: userData.role === 'admin' ? userData.tenantTemplate : adminTenantTemplate,
-            searchIndexVersion: userData.searchIndexVersion
+            searchIndexVersion: userData.searchIndexVersion,
+            isLimitedMode: limitedModeActive
           } as User;
 
           setEditAgencyLogo(newUser.agencyLogo || '');
@@ -1207,6 +1288,14 @@ export default function App() {
           setOwnerTemplate(finalOwnerTemplate);
           setTenantTemplate(finalTenantTemplate);
         } else {
+          // Si falló por cuota y no hay caché, mostrar mensaje en vez de reintentar auto-healing
+          if (isQuotaProblem || isFirestoreCircuitBreakerActive()) {
+            setAuthQuotaErrorMessage('El servidor alcanzó su límite diario gratuito. Intenta más tarde.');
+            setCurrentUser(null);
+            setIsAuthReady(true);
+            return;
+          }
+
           console.warn('User document NOT found in Firestore for UID:', updatedUser.uid, '- Auto-healing document in database...');
           const isSuper = updatedUser.email === SUPER_ADMIN_EMAIL;
           const expiration = new Date();
@@ -1250,9 +1339,14 @@ export default function App() {
             setOwnerTemplate(defaultOwnerHtml);
             setTenantTemplate(defaultTenantHtml);
             setCurrentUser(newUser);
+            setAuthQuotaErrorMessage(null);
             console.log('User document auto-repaired and created successfully in Firestore');
           } catch (error) {
             console.error('Error auto-creating user document in Firestore:', error);
+            if (isFirestoreQuotaError(error)) {
+              tripFirestoreCircuitBreaker(error);
+              setAuthQuotaErrorMessage('El servidor alcanzó su límite diario gratuito. Intenta más tarde.');
+            }
             setCurrentUser(null);
           }
         }
@@ -1375,6 +1469,21 @@ export default function App() {
           if (!changed) return inv;
           return { ...inv, spaces: updatedSpaces, annexes: updatedAnnexes };
         }));
+      } else if (event.type === 'sync_started') {
+        setIsSyncingPhotos(true);
+      } else if (event.type === 'photo_failed') {
+        setLastSyncAttemptTimestamp(Date.now());
+        if (event.error) {
+          setLastSyncError(event.error);
+        }
+      } else if (event.type === 'sync_finished') {
+        setIsSyncingPhotos(false);
+        setLastSyncAttemptTimestamp(Date.now());
+        if (syncedPhotosCounterRef.current > 0) {
+          const count = syncedPhotosCounterRef.current;
+          syncedPhotosCounterRef.current = 0;
+          showNotify(`${count} ${count === 1 ? 'foto subida' : 'fotos subidas'} ✓`, 'success', 3500);
+        }
       }
     });
 
@@ -1642,8 +1751,22 @@ export default function App() {
 
 
   const notificationTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const lastErrorToastRef = useRef<{ message: string; timestamp: number } | null>(null);
 
   const showNotify = (message: string, type: 'success' | 'error' | 'info' | 'warning' = 'success', duration: number = 3500) => {
+    // No repetir el mismo toast más de una vez por episodio de error
+    if (type === 'error' || type === 'warning') {
+      const now = Date.now();
+      if (
+        lastErrorToastRef.current &&
+        lastErrorToastRef.current.message === message &&
+        now - lastErrorToastRef.current.timestamp < 30000
+      ) {
+        return;
+      }
+      lastErrorToastRef.current = { message, timestamp: now };
+    }
+
     if (notificationTimeoutRef.current) {
       clearTimeout(notificationTimeoutRef.current);
     }
@@ -1667,7 +1790,7 @@ export default function App() {
   // Contadores de las pestañas con getCountFromServer y caché de 60 s
   const fetchTabCounts = async (force: boolean = false) => {
     if (!currentUser || currentUser.role !== 'admin' || !currentUser.email) return;
-    if (!navigator.onLine) return;
+    if (!navigator.onLine || isFirestoreCircuitBreakerActive()) return;
 
     const now = Date.now();
     if (!force && lastCountsFetchRef.current && (now - lastCountsFetchRef.current < 60000) && tabCounts !== null) {
@@ -1710,6 +1833,9 @@ export default function App() {
       });
       lastCountsFetchRef.current = Date.now();
     } catch (e) {
+      if (isFirestoreQuotaError(e)) {
+        tripFirestoreCircuitBreaker(e);
+      }
       console.warn('Error fetching tab counts from server:', e);
     }
   };
@@ -1718,7 +1844,24 @@ export default function App() {
     if (currentUser?.role === 'admin' && isAuthReady) {
       fetchTabCounts();
     }
-  }, [currentUser?.id, currentUser?.role, currentUser?.email, isAuthReady]);
+  }, [currentUser?.id, currentUser?.role, currentUser?.email, isAuthReady, circuitBreakerEpoch]);
+
+  const handleRetryFirestore = () => {
+    resetFirestoreCircuitBreaker();
+    setCircuitBreakerEpoch(prev => prev + 1);
+    fetchTabCounts(true);
+    showNotify('Reintentando conexión con Firebase...', 'info');
+  };
+
+  const handleRetryStorage = async () => {
+    resetStorageCircuitBreaker();
+    try {
+      await photoSyncEngine.triggerSync();
+      showNotify('Reintentando subida de fotografías...', 'info');
+    } catch (e) {
+      console.warn('Error al reintentar subida de fotos:', e);
+    }
+  };
 
   // Constructor de filtros Firestore para el administrador
   const buildAdminConstraints = (filter: string, searchWord?: string) => {
@@ -1757,6 +1900,10 @@ export default function App() {
   // Cargar páginas adicionales (>30) para el administrador con getDocs + startAfter
   const handleLoadMore = async () => {
     if (!currentUser || currentUser.role !== 'admin' || !lastVisibleDoc || isLoadingMore || !hasMorePages) return;
+    if (isFirestoreCircuitBreakerActive()) {
+      showNotify('Límite de Firebase alcanzado. Mostrando datos guardados en el teléfono.', 'warning');
+      return;
+    }
     setIsLoadingMore(true);
     try {
       const searchWords = normalizeText(debouncedSearchTerm).split(/\s+/).filter(w => w.length >= 2);
@@ -1781,6 +1928,9 @@ export default function App() {
       setLastVisibleDoc(snap.docs[snap.docs.length - 1] || null);
       setHasMorePages(snap.docs.length === 30);
     } catch (e) {
+      if (isFirestoreQuotaError(e)) {
+        tripFirestoreCircuitBreaker(e);
+      }
       console.error('Error loading more inventories:', e);
       showNotify('Error al cargar más inventarios', 'error');
     } finally {
@@ -1902,7 +2052,7 @@ export default function App() {
         unsubGrace();
       };
     }
-  }, [currentUser?.id, currentUser?.email, currentUser?.role, statusFilter, debouncedSearchTerm, isAuthReady]);
+  }, [currentUser?.id, currentUser?.email, currentUser?.role, statusFilter, debouncedSearchTerm, isAuthReady, circuitBreakerEpoch]);
 
   // Admin: Combina página 1 (live) y páginas extras, aplicando filtrado cliente para palabras adicionales si multi-término
   useEffect(() => {
@@ -1969,9 +2119,8 @@ export default function App() {
     const targetUrl = photo.url || photo.thumbUrl || (photo.dataUrl?.startsWith('http') ? photo.dataUrl : null);
     if (targetUrl) {
       try {
-        const response = await fetch(targetUrl);
-        if (response.ok) {
-          const blob = await response.blob();
+        const blob = await fetchBlob(targetUrl);
+        if (blob) {
           return { type: 'blob', blob };
         }
       } catch (e) {
@@ -2045,8 +2194,7 @@ export default function App() {
         }
       }
 
-      const content = await zip.generateAsync({ type: 'blob' });
-      saveAs(content, `Fotos_Inventario_${inventory.propertyName.replace(/\s+/g, '_')}.zip`);
+      await saveZip(zip, `Fotos_Inventario_${inventory.propertyName.replace(/\s+/g, '_')}.zip`);
       showNotify('Fotos descargadas correctamente');
     } catch (err: any) {
       console.error('Error generating ZIP:', err);
@@ -2061,6 +2209,29 @@ export default function App() {
   };
 
   const startListening = (spaceIndex: number, itemIndex: number, itemId: string, isGeneralObservation: boolean = false) => {
+    if (isNative) {
+      setIsListening(itemId);
+      nativeListen('es-ES')
+        .then((transcript) => {
+          if (transcript && currentInventory) {
+            const updated = [...currentInventory.spaces];
+            if (isGeneralObservation) {
+              const currentObs = updated[spaceIndex].generalObservations || '';
+              updated[spaceIndex].generalObservations = currentObs ? `${currentObs} ${transcript}` : transcript;
+            } else {
+              const currentDetails = updated[spaceIndex].items[itemIndex].details;
+              updated[spaceIndex].items[itemIndex].details = currentDetails ? `${currentDetails} ${transcript}` : transcript;
+            }
+            setCurrentInventory({ ...currentInventory, spaces: updated });
+            showNotify('Texto dictado añadido');
+          }
+        })
+        .catch((e: any) => {
+          showNotify(e?.message === 'not-allowed' ? 'Permiso de micrófono denegado' : 'Dictado por voz no disponible', 'error');
+        })
+        .finally(() => setIsListening(null));
+      return;
+    }
     const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     
     if (!SpeechRecognition) {
@@ -2600,7 +2771,7 @@ export default function App() {
       try {
         const pendingPhotos = await getPendingPhotosByInventory(currentInventory.id);
         if (pendingPhotos.length > 0) {
-          showNotify(`Aviso: Hay ${pendingPhotos.length} fotografía(s) pendientes de subir a la nube. Se sincronizarán automáticamente en segundo plano.`, 'warning');
+          showNotify(`Aviso: Hay ${pendingPhotos.length} fotografía(s) pendientes de subir a la nube. Se subirán cuando abras la app con conexión.`, 'warning');
         }
       } catch (e) {
         console.warn('Error verificando fotos pendientes en confirmFinalSave:', e);
@@ -3791,7 +3962,7 @@ export default function App() {
           address: currentInventory.address,
           agencyName: currentUser?.agencyName || 'CheckInventory',
           agencyLogo: currentUser?.agencyLogo || '',
-          origin: window.location.origin
+          origin: webOrigin()
         })
       });
 
@@ -4077,7 +4248,7 @@ export default function App() {
       doc.text(splitText, 14, currentY);
       currentY += (splitText.length * 6) + 5;
 
-      const downloadUrl = `${window.location.origin}/?downloadPhotos=${inventory.id}`;
+      const downloadUrl = `${webOrigin()}/?downloadPhotos=${inventory.id}`;
       doc.setFontSize(12);
       doc.setFont('helvetica', 'bold');
       doc.setTextColor(0, 0, 255); // Blue color for link
@@ -4285,7 +4456,7 @@ export default function App() {
                    recipient === 'reception' ? '_Actas_Recepcion' : 
                    recipient === 'reception_owner' ? '_Acta_Entrega_Propietario' :
                    recipient === 'reception_tenant' ? '_Acta_Recibido_Inquilino' : '';
-    doc.save(`Inventario_${inventory.propertyName.replace(/\s+/g, '_')}_${inventory.date}${suffix}.pdf`);
+    savePdf(doc, `Inventario_${inventory.propertyName.replace(/\s+/g, '_')}_${inventory.date}${suffix}.pdf`);
   };
 
   const sharePDF = async (inventory: Inventory, recipient: 'owner' | 'tenant' | 'both' | 'reception' | 'reception_owner' | 'reception_tenant' = 'both') => {
@@ -4313,10 +4484,10 @@ export default function App() {
         showNotify('Documento compartido con éxito');
       } else if (navigator.share) {
         // Direct download fallback
-        doc.save(fileName);
+        savePdf(doc, fileName);
         showNotify('PDF descargado en el dispositivo');
       } else {
-        doc.save(fileName);
+        savePdf(doc, fileName);
       }
     } catch (error: any) {
       if (error.name !== 'AbortError') {
@@ -4352,7 +4523,7 @@ export default function App() {
   // Carga contadores de inventarios para cada dependiente con getCountFromServer
   useEffect(() => {
     if (!currentUser || currentUser.role !== 'admin' || dependents.length === 0) return;
-    if (!navigator.onLine) return;
+    if (!navigator.onLine || isFirestoreCircuitBreakerActive()) return;
 
     let isMounted = true;
     const loadDependentCounts = async () => {
@@ -4368,6 +4539,9 @@ export default function App() {
             ]);
             countsMap[dep.id] = snapCreated.data().count + snapAssigned.data().count;
           } catch (e) {
+            if (isFirestoreQuotaError(e)) {
+              tripFirestoreCircuitBreaker(e);
+            }
             console.warn(`Error getting count for dependent ${dep.id}:`, e);
           }
         })
@@ -4379,7 +4553,7 @@ export default function App() {
 
     loadDependentCounts();
     return () => { isMounted = false; };
-  }, [dependents, currentUser?.id, currentUser?.role]);
+  }, [dependents, currentUser?.id, currentUser?.role, circuitBreakerEpoch]);
 
   // Carga bajo demanda el historial de inventarios del dependiente seleccionado (páginas de 30) y su contador
   useEffect(() => {
@@ -4396,6 +4570,10 @@ export default function App() {
     const depId = selectedDependentForInventories.id;
 
     const loadModalData = async () => {
+      if (isFirestoreCircuitBreakerActive()) {
+        showNotify('Límite de Firebase alcanzado. Mostrando datos guardados en el teléfono.', 'warning');
+        return;
+      }
       setDependentModalLoading(true);
       try {
         const qCreatedCount = query(collection(db, 'inventories'), where('createdBy', '==', depId));
@@ -4452,6 +4630,10 @@ export default function App() {
 
   const handleLoadMoreDependentModal = async () => {
     if (!selectedDependentForInventories || dependentModalLoadingMore || !dependentModalHasMore) return;
+    if (isFirestoreCircuitBreakerActive()) {
+      showNotify('Límite de Firebase alcanzado. Mostrando datos guardados en el teléfono.', 'warning');
+      return;
+    }
     setDependentModalLoadingMore(true);
     try {
       const depId = selectedDependentForInventories.id;
@@ -4498,6 +4680,9 @@ export default function App() {
       const totalCount = dependentModalCount ?? newCombined.length;
       setDependentModalHasMore(newCombined.length < totalCount && (Boolean(depLastCreatedDocRef.current) || Boolean(depLastAssignedDocRef.current)));
     } catch (e) {
+      if (isFirestoreQuotaError(e)) {
+        tripFirestoreCircuitBreaker(e);
+      }
       console.error('Error loading more in dependent modal:', e);
       showNotify('Error al cargar más inventarios del dependiente', 'error');
     } finally {
@@ -4556,7 +4741,7 @@ export default function App() {
   }
 
   if (!currentUser) {
-    return <Auth />;
+    return <Auth serverQuotaError={authQuotaErrorMessage || undefined} />;
   }
 
   if (!isEmailVerified) {
@@ -4597,7 +4782,7 @@ export default function App() {
                 if (auth.currentUser) {
                   try {
                     await sendEmailVerification(auth.currentUser, {
-                      url: window.location.origin,
+                      url: webOrigin(),
                       handleCodeInApp: false,
                     });
                     showNotify('Enlace de verificación reenviado.');
@@ -4628,29 +4813,30 @@ export default function App() {
       <AnimatePresence>
         {notification?.show && (
           <motion.div
-            initial={{ opacity: 0, y: 50 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 50 }}
-            className={`fixed bottom-24 left-1/2 -translate-x-1/2 z-50 px-6 py-3 rounded-2xl shadow-2xl flex items-center gap-3 ${
+            initial={{ opacity: 0, y: 30, scale: 0.95 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 20, scale: 0.95 }}
+            transition={{ duration: 0.2 }}
+            className={`fixed bottom-20 sm:bottom-6 left-1/2 -translate-x-1/2 z-[130] px-4 py-2 rounded-full shadow-xl flex items-center gap-2 max-w-[90vw] text-xs font-bold select-none pointer-events-none ${
               notification.type === 'error'
                 ? 'bg-red-600 text-white'
                 : notification.type === 'warning'
                 ? 'bg-amber-600 text-white'
                 : notification.type === 'info'
-                ? 'bg-blue-600 text-white'
+                ? 'bg-neutral-800 text-white'
                 : 'bg-black text-white'
             }`}
           >
-            <div className={`w-2 h-2 rounded-full ${
+            <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${
               notification.type === 'error'
                 ? 'bg-white'
                 : notification.type === 'warning'
-                ? 'bg-yellow-200'
+                ? 'bg-amber-200'
                 : notification.type === 'info'
-                ? 'bg-blue-200'
+                ? 'bg-blue-300'
                 : 'bg-emerald-400'
             }`} />
-            <span className="text-sm font-bold">{notification.message}</span>
+            <span className="truncate">{notification.message}</span>
           </motion.div>
         )}
       </AnimatePresence>
@@ -5654,46 +5840,15 @@ export default function App() {
         )}
       </AnimatePresence>
 
-      <div className="sticky top-0 z-50">
-        {/* Banner Global de Fotos Pendientes de Sincronización (Requirement 12) */}
-        {globalPendingPhotos.length > 0 && (
-          <div className="bg-amber-500/10 dark:bg-amber-950/40 border-b border-amber-500/20 text-amber-950 dark:text-amber-200 px-3 sm:px-6 py-2 text-xs flex flex-wrap items-center justify-between gap-2 backdrop-blur-md">
-            <div className="flex items-center gap-2 min-w-0">
-              <CloudUpload size={16} className="text-amber-600 dark:text-amber-400 shrink-0 animate-pulse" />
-              <span className="font-bold whitespace-nowrap">
-                {globalPendingPhotos.length} {globalPendingPhotos.length === 1 ? 'foto sin subir' : 'fotos sin subir'} a la nube
-              </span>
-              <span className="opacity-40 hidden sm:inline">•</span>
-              <span className="text-[11px] opacity-80 truncate hidden sm:inline">
-                {(() => {
-                  if (!isOnline) return 'Esperando conexión a Internet';
-                  const failed = globalPendingPhotos.find(p => p.status === 'failed' && p.lastError);
-                  if (failed?.lastError) return failed.lastError;
-                  return 'Sincronización en curso en segundo plano';
-                })()}
-              </span>
-            </div>
-            <button
-              type="button"
-              disabled={isRetryingSync}
-              onClick={async () => {
-                setIsRetryingSync(true);
-                try {
-                  await photoSyncEngine.triggerSync();
-                  showNotify('Iniciando subida de fotografías pendientes...', 'info');
-                } catch (e) {
-                  console.warn('Error al forzar sincronización:', e);
-                } finally {
-                  setTimeout(() => setIsRetryingSync(false), 2000);
-                }
-              }}
-              className="px-3 py-1 bg-amber-600 hover:bg-amber-700 active:scale-95 text-white rounded-lg text-[11px] font-bold shadow-sm transition-all disabled:opacity-50 shrink-0 flex items-center gap-1.5 cursor-pointer"
-            >
-              <RefreshCw size={12} className={isRetryingSync ? 'animate-spin' : ''} />
-              <span>{isRetryingSync ? 'Reintentando...' : 'Reintentar ahora'}</span>
-            </button>
-          </div>
-        )}
+      <div className="sticky top-0 z-50 bg-white" style={{ paddingTop: 'env(safe-area-inset-top, 0px)' }}>
+        {/* Franja fija única descartable de máx. 32 px para errores bloqueantes (como límite diario de Firestore) */}
+        <CriticalBlockingBanner 
+          isVisible={Boolean(isFirestoreQuotaActive && !isBlockingBannerDismissed)}
+          message="Límite diario de Firebase alcanzado: la app guarda datos en el teléfono."
+          onDismiss={() => setIsBlockingBannerDismissed(true)}
+          onAction={() => setIsSyncStatusSheetOpen(true)}
+          actionLabel="Ver detalles"
+        />
 
         {/* Header */}
         <header className="bg-white border-b border-black/5 px-3 sm:px-6 py-3 sm:py-4 flex items-center justify-between">
@@ -5709,6 +5864,18 @@ export default function App() {
           </div>
           
           <div className="flex items-center gap-1.5 sm:gap-3">
+            {/* Indicador compacto de nube (SyncStatusChip, 36-40 px) */}
+            <SyncStatusChip 
+              isOnline={isOnline}
+              isLimitedMode={Boolean(isLimitedMode || currentUser.isLimitedMode)}
+              isReadingFromCache={isReadingFromCache}
+              pendingPhotosCount={globalPendingPhotos.length}
+              isSyncing={isSyncingPhotos}
+              hasQuotaError={isFirestoreQuotaActive}
+              hasStorageError={isStorageQuotaActive}
+              onClick={() => setIsSyncStatusSheetOpen(true)}
+            />
+
             <button
               onClick={() => toggleDarkMode()}
               className="w-9 h-9 sm:w-10 sm:h-10 flex items-center justify-center rounded-xl bg-black/5 hover:bg-black/10 transition-all text-black shrink-0"
@@ -5764,14 +5931,6 @@ export default function App() {
             </button>
           </div>
         </header>
-
-        {/* Offline indicator banner */}
-        {(!isOnline || isReadingFromCache) && (
-          <div className="bg-amber-500 text-white px-4 py-2 text-center text-xs font-bold flex items-center justify-center gap-2 shadow-inner">
-            <WifiOff size={14} className="shrink-0" />
-            <span>Mostrando datos guardados en el teléfono</span>
-          </div>
-        )}
 
         {/* Sub-header for views other than list */}
         {view !== 'list' && (
@@ -9533,8 +9692,8 @@ export default function App() {
                     <button
                       onClick={async () => {
                         try {
-                          const response = await fetch(fullscreenPhoto.url);
-                          const blob = await response.blob();
+                          const blob = await fetchBlob(fullscreenPhoto.url);
+                          if (!blob) throw new Error('No se pudo descargar la foto');
                           const file = new File([blob], `foto_${fullscreenPhoto.title.replace(/\s+/g, '_')}.jpg`, { type: 'image/jpeg' });
                           if (navigator.canShare && navigator.canShare({ files: [file] })) {
                             await navigator.share({
@@ -9591,6 +9750,34 @@ export default function App() {
           </div>
         )}
       </AnimatePresence>
+
+      {/* Hoja Inferior (Bottom Sheet) de Sincronización */}
+      <SyncStatusSheet
+        isOpen={isSyncStatusSheetOpen}
+        onClose={() => setIsSyncStatusSheetOpen(false)}
+        isOnline={isOnline}
+        isLimitedMode={Boolean(isLimitedMode || currentUser?.isLimitedMode)}
+        isReadingFromCache={isReadingFromCache}
+        pendingPhotosCount={globalPendingPhotos.length}
+        lastErrorReason={lastSyncError}
+        lastAttemptTimestamp={lastSyncAttemptTimestamp}
+        hasFirestoreQuotaError={isFirestoreQuotaActive}
+        hasStorageQuotaError={isStorageQuotaActive}
+        onRetryNow={async () => {
+          setIsRetryingSync(true);
+          try {
+            handleRetryFirestore();
+            await handleRetryStorage();
+          } finally {
+            setTimeout(() => setIsRetryingSync(false), 1500);
+          }
+        }}
+        onViewPendingPhotos={() => {
+          if (view !== 'list') setView('list');
+          showNotify(`${globalPendingPhotos.length} fotos pendientes de subir. Se subirán cuando abras la app con conexión.`, 'info');
+        }}
+        isRetrying={isRetryingSync}
+      />
     </div>
   );
 }

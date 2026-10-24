@@ -1,3 +1,4 @@
+/* android-patched */
 import React, { useState } from 'react';
 import { motion } from 'motion/react';
 import { Mail, Lock, Shield, Users, ArrowRight, User as UserIcon, Key, Eye, EyeOff } from 'lucide-react';
@@ -12,8 +13,14 @@ import {
 import { doc, setDoc, getDoc, query, where, collection, getDocs, writeBatch, serverTimestamp } from 'firebase/firestore';
 import { UserRole, SUPER_ADMIN_EMAIL } from '../types';
 import { addMonths } from 'date-fns';
+import { isFirestoreQuotaError } from '../lib/quotaCircuitBreaker';
+import { webOrigin } from '../native';
 
-export const Auth: React.FC = () => {
+interface AuthProps {
+  serverQuotaError?: string;
+}
+
+export const Auth: React.FC<AuthProps> = ({ serverQuotaError }) => {
   const [isLogin, setIsLogin] = useState(true);
   const [isForgotPassword, setIsForgotPassword] = useState(false);
   const [email, setEmail] = useState('');
@@ -38,7 +45,7 @@ export const Auth: React.FC = () => {
 
     try {
       await sendPasswordResetEmail(auth, email, {
-        url: window.location.origin,
+        url: webOrigin(),
       });
       setSuccessMessage('Se ha enviado un correo para restablecer tu contraseña. Por favor revisa tu bandeja de entrada.');
       setIsForgotPassword(false);
@@ -170,7 +177,7 @@ export const Auth: React.FC = () => {
         // Try to send verification email (non-blocking if service is disabled in dev)
         try {
           await sendEmailVerification(user, {
-            url: window.location.origin,
+            url: webOrigin(),
             handleCodeInApp: false,
           });
         } catch (emailErr) {
@@ -229,7 +236,9 @@ export const Auth: React.FC = () => {
       if (auth.currentUser) {
         await signOut(auth);
       }
-      if (err.code === 'auth/user-not-found') {
+      if (isFirestoreQuotaError(err)) {
+        setError('El servidor alcanzó su límite diario gratuito. Intenta más tarde.');
+      } else if (err.code === 'auth/user-not-found') {
         setError('Este correo no está registrado. ¿Deseas crear una cuenta?');
       } else if (err.code === 'auth/wrong-password' || err.code === 'auth/invalid-credential') {
         setError('Credenciales incorrectas. Verifica tu correo y contraseña.');
@@ -508,21 +517,21 @@ export const Auth: React.FC = () => {
               </motion.div>
             )}
 
-            {error && (
+            {(error || serverQuotaError) && (
               <motion.div 
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
-                className="text-red-500 text-xs font-bold text-center space-y-2"
+                className={`${(error || serverQuotaError)?.includes('límite diario') ? 'bg-amber-50 border border-amber-200 text-amber-900 p-4 rounded-2xl' : 'text-red-500'} text-xs font-bold text-center space-y-2`}
               >
-                <p>{error}</p>
-                {error.includes('no está registrado') && (
+                <p>{error || serverQuotaError}</p>
+                {error && error.includes('no está registrado') && (
                   <button 
                     type="button"
                     onClick={() => {
                       setIsLogin(false);
                       setError('');
                     }}
-                    className="text-black underline block mx-auto"
+                    className="text-black underline block mx-auto cursor-pointer"
                   >
                     Registrarse ahora
                   </button>

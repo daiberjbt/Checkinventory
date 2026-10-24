@@ -29,6 +29,7 @@ export interface User {
   ownerTemplate?: string;
   tenantTemplate?: string;
   searchIndexVersion?: number;
+  isLimitedMode?: boolean;
 }
 
 export interface LicenseEvent {

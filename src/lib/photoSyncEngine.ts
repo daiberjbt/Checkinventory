@@ -10,6 +10,12 @@ import {
   resetStaleUploadingRecords
 } from './offlinePhotoDb';
 import { createThumbnailBlob } from '../photos';
+import {
+  isStorageQuotaError,
+  isStorageCircuitBreakerActive,
+  tripStorageCircuitBreaker,
+  onStorageCircuitBreakerChange
+} from './quotaCircuitBreaker';
 
 type SyncListener = (event: {
   type: 'photo_synced' | 'photo_failed' | 'sync_started' | 'sync_finished';
@@ -24,7 +30,8 @@ function getBackoffDelayMs(retryCount: number): number {
   if (retryCount <= 1) return 1 * 60 * 1000;      // 1 min
   if (retryCount === 2) return 2 * 60 * 1000;      // 2 min
   if (retryCount === 3) return 5 * 60 * 1000;      // 5 min
-  return 15 * 60 * 1000;                          // 15 min
+  if (retryCount === 4) return 15 * 60 * 1000;     // 15 min
+  return 30 * 60 * 1000;                          // 30 min
 }
 
 export class PhotoSyncEngine {
@@ -50,6 +57,19 @@ export class PhotoSyncEngine {
         };
       } catch (e) {
         console.warn('[SyncEngine] BroadcastChannel no disponible', e);
+      }
+    }
+
+    if (typeof window !== 'undefined') {
+      try {
+        onStorageCircuitBreakerChange((active) => {
+          if (!active && this.currentAdminUid) {
+            console.log('[SyncEngine] Storage circuit breaker finalizó o fue reiniciado. Reintentando subida de fotos...');
+            this.processQueue();
+          }
+        });
+      } catch (e) {
+        console.warn('[SyncEngine] Error suscribiendo a onStorageCircuitBreakerChange:', e);
       }
     }
   }
@@ -222,6 +242,11 @@ export class PhotoSyncEngine {
   private async executeQueueProcessing(): Promise<void> {
     const adminUid = this.currentAdminUid;
     if (!adminUid || this.isRunning) return;
+
+    if (isStorageCircuitBreakerActive()) {
+      console.log('[SyncEngine] Storage circuit breaker activo (cuota agotada). Subida de fotos en espera.');
+      return;
+    }
 
     this.isRunning = true;
     this.notify({ type: 'sync_started' });
@@ -508,12 +533,15 @@ export class PhotoSyncEngine {
       const errCode = String(err?.code || '');
       const errMsg = String(err?.message || err);
 
-      if (errCode.startsWith('storage/')) {
+      if (errCode.startsWith('storage/') || isStorageQuotaError(err)) {
+        if (isStorageQuotaError(err)) {
+          tripStorageCircuitBreaker(err);
+        }
         let readableError = 'Error al subir imagen a Storage';
         if (errCode === 'storage/unauthorized') {
           readableError = 'Sin autorización para escribir en Storage (verifique sesión)';
-        } else if (errCode === 'storage/quota-exceeded') {
-          readableError = 'Cuota de almacenamiento superada en Storage';
+        } else if (errCode === 'storage/quota-exceeded' || isStorageQuotaError(err)) {
+          readableError = 'Límite de almacenamiento de fotos alcanzado: las fotos se guardan en el teléfono y se subirán después';
         } else if (errCode === 'storage/retry-limit-exceeded') {
           readableError = 'Límite de intentos de conexión con Storage agotado';
         }

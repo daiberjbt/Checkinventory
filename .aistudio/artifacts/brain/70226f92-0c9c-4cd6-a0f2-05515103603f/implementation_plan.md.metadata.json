@@ -1,6 +1,6 @@
 {
-  "summary":  "Plan detallado para convertir la lista de inventarios en un sistema paginado en servidor de 30 en 30 ítems, con filtros dedicados por pestaña, contadores optimizados con getCountFromServer y caché de 60s, búsqueda en servidor mediante searchTokens y debounce de 400ms, consultas específicas desacopladas para dependientes, y optimización de rendimiento en tarjetas sin alterar la interfaz visual.",
-  "updatedAt":  "2026-10-22T13:34:16.972860189Z",
+  "summary":  "Plan de rediseño de avisos de estado sin ocupar espacio fijo en pantalla: indicador compacto SyncStatusChip (36-40 px) en el encabezado con cuatro estados visuales y punto de modo limitado/offline, hoja inferior (Bottom Sheet) detallada con reintento y consulta de fotos pendientes, toasts puntuales de 3-4 s no repetitivos, franja fija de 32 px exclusiva para bloqueos críticos y corrección de textos a 'Se subirán cuando abras la app con conexión'.",
+  "updatedAt":  "2026-10-24T22:22:42.963416862Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

@@ -2,9 +2,8 @@ import type JSZip from 'jszip';
 
 /**
  * Genera el ZIP por partes y entrega cada parte ya en base64.
- * Cada parte (salvo la última) es múltiplo de 3 bytes para que la unión
- * de los base64 sea idéntica al base64 del archivo completo.
- * Con pausa/reanudación se evita acumular cientos de MB en memoria.
+ * Cada parte (salvo la ultima) es multiplo de 3 bytes para que la union de los base64
+ * sea identica al base64 del archivo completo. Con pausa/reanudacion no se acumulan cientos de MB en memoria.
  */
 export function streamZipBase64(
   zip: JSZip,
