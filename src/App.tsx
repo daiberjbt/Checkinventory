@@ -478,6 +478,9 @@ export default function App() {
   const [dependentModalLoading, setDependentModalLoading] = useState(false);
   const [dependentModalCount, setDependentModalCount] = useState<number | null>(null);
   const [dependentModalHasMore, setDependentModalHasMore] = useState(false);
+  const [dependentModalLoadingMore, setDependentModalLoadingMore] = useState(false);
+  const depLastCreatedDocRef = useRef<DocumentSnapshot | null>(null);
+  const depLastAssignedDocRef = useRef<DocumentSnapshot | null>(null);
   const [isListening, setIsListening] = useState<string | null>(null);
   const [showConfirm, setShowConfirm] = useState<{
     show: boolean;
@@ -4384,6 +4387,8 @@ export default function App() {
       setDependentModalInvs([]);
       setDependentModalCount(null);
       setDependentModalHasMore(false);
+      depLastCreatedDocRef.current = null;
+      depLastAssignedDocRef.current = null;
       return;
     }
 
@@ -4418,21 +4423,22 @@ export default function App() {
 
         if (!isMounted) return;
 
-        if (cCreated && cAssigned) {
-          setDependentModalCount(cCreated.data().count + cAssigned.data().count);
-        }
+        const totalCount = (cCreated?.data().count || 0) + (cAssigned?.data().count || 0);
+        setDependentModalCount(totalCount);
 
         const map = new Map<string, Inventory>();
         if (docsCreated) {
           docsCreated.docs.forEach(d => map.set(d.id, { id: d.id, ...d.data() } as Inventory));
+          depLastCreatedDocRef.current = docsCreated.docs.length > 0 ? docsCreated.docs[docsCreated.docs.length - 1] : null;
         }
         if (docsAssigned) {
           docsAssigned.docs.forEach(d => map.set(d.id, { id: d.id, ...d.data() } as Inventory));
+          depLastAssignedDocRef.current = docsAssigned.docs.length > 0 ? docsAssigned.docs[docsAssigned.docs.length - 1] : null;
         }
 
         const combined = Array.from(map.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-        setDependentModalInvs(combined.slice(0, 30));
-        setDependentModalHasMore(combined.length >= 30);
+        setDependentModalInvs(combined);
+        setDependentModalHasMore(combined.length < totalCount && (Boolean(depLastCreatedDocRef.current) || Boolean(depLastAssignedDocRef.current)));
       } catch (err) {
         console.error('Error loading dependent modal inventories:', err);
       } finally {
@@ -4443,6 +4449,61 @@ export default function App() {
     loadModalData();
     return () => { isMounted = false; };
   }, [selectedDependentForInventories]);
+
+  const handleLoadMoreDependentModal = async () => {
+    if (!selectedDependentForInventories || dependentModalLoadingMore || !dependentModalHasMore) return;
+    setDependentModalLoadingMore(true);
+    try {
+      const depId = selectedDependentForInventories.id;
+      const promises: Promise<any>[] = [];
+      if (depLastCreatedDocRef.current) {
+        promises.push(getDocs(query(
+          collection(db, 'inventories'),
+          where('createdBy', '==', depId),
+          orderBy('updatedAt', 'desc'),
+          startAfter(depLastCreatedDocRef.current),
+          limit(30)
+        )).catch(() => null));
+      } else {
+        promises.push(Promise.resolve(null));
+      }
+
+      if (depLastAssignedDocRef.current) {
+        promises.push(getDocs(query(
+          collection(db, 'inventories'),
+          where('assignedTo', '==', depId),
+          orderBy('updatedAt', 'desc'),
+          startAfter(depLastAssignedDocRef.current),
+          limit(30)
+        )).catch(() => null));
+      } else {
+        promises.push(Promise.resolve(null));
+      }
+
+      const [nextCreated, nextAssigned] = await Promise.all(promises);
+
+      const map = new Map<string, Inventory>();
+      dependentModalInvs.forEach(i => map.set(i.id, i));
+      if (nextCreated) {
+        nextCreated.docs.forEach((d: any) => map.set(d.id, { id: d.id, ...d.data() } as Inventory));
+        depLastCreatedDocRef.current = nextCreated.docs.length === 30 ? nextCreated.docs[nextCreated.docs.length - 1] : null;
+      }
+      if (nextAssigned) {
+        nextAssigned.docs.forEach((d: any) => map.set(d.id, { id: d.id, ...d.data() } as Inventory));
+        depLastAssignedDocRef.current = nextAssigned.docs.length === 30 ? nextAssigned.docs[nextAssigned.docs.length - 1] : null;
+      }
+
+      const newCombined = Array.from(map.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+      setDependentModalInvs(newCombined);
+      const totalCount = dependentModalCount ?? newCombined.length;
+      setDependentModalHasMore(newCombined.length < totalCount && (Boolean(depLastCreatedDocRef.current) || Boolean(depLastAssignedDocRef.current)));
+    } catch (e) {
+      console.error('Error loading more in dependent modal:', e);
+      showNotify('Error al cargar más inventarios del dependiente', 'error');
+    } finally {
+      setDependentModalLoadingMore(false);
+    }
+  };
 
   const handleLogout = async () => {
     confirmAction(
@@ -4704,6 +4765,24 @@ export default function App() {
                         </div>
                       ))}
                     </div>
+                    {dependentModalHasMore && (
+                      <div className="flex justify-center pt-6">
+                        <button
+                          onClick={handleLoadMoreDependentModal}
+                          disabled={dependentModalLoadingMore}
+                          className="bg-black/5 hover:bg-black/10 active:scale-95 text-black px-6 py-3 rounded-2xl text-xs font-bold transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                        >
+                          {dependentModalLoadingMore ? (
+                            <>
+                              <div className="w-3.5 h-3.5 border-2 border-black/40 border-t-transparent rounded-full animate-spin" />
+                              <span>Cargando más...</span>
+                            </>
+                          ) : (
+                            <span>Cargar más inventarios</span>
+                          )}
+                        </button>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
