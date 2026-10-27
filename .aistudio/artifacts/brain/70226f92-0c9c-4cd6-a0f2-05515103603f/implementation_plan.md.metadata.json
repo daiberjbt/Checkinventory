@@ -1,6 +1,6 @@
 {
-  "summary":  "Plan de rediseño de avisos de estado sin ocupar espacio fijo en pantalla: indicador compacto SyncStatusChip (36-40 px) en el encabezado con cuatro estados visuales y punto de modo limitado/offline, hoja inferior (Bottom Sheet) detallada con reintento y consulta de fotos pendientes, toasts puntuales de 3-4 s no repetitivos, franja fija de 32 px exclusiva para bloqueos críticos y corrección de textos a 'Se subirán cuando abras la app con conexión'.",
-  "updatedAt":  "2026-10-24T22:22:42.963416862Z",
+  "summary":  "Plan de implementación para la cámara continua integrada (ContinuousCamera): captura rápida con un solo toque sin salir de la app, destello y vibración háptica instantáneos, cola de procesamiento en memoria secuencial compartida con la ruta de IndexedDB, interfaz completa con contador, miniatura, deshacer y linterna, fallback automático a cámara del sistema ante falta de permisos, y gestión de ciclo de vida con visibilidad y botón atrás de Android.",
+  "updatedAt":  "2026-10-27T23:28:14.954666254Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

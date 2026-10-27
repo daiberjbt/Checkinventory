@@ -1,131 +1,136 @@
-# Plan de Implementación: Rediseño No Intrusivo de Avisos de Estado (SyncStatusChip, Bottom Sheet y Toasts)
+# Plan de Implementación: Cámara Continua Integrada (ContinuousCamera)
 
-Este plan detalla el rediseño integral de los avisos de estado (cuota, sin conexión y fotos pendientes) para que **no ocupen espacio fijo de la pantalla**, reemplazando los banners superiores apilados por un chip compacto en el encabezado, una hoja inferior (*Bottom Sheet*) informativa bajo demanda, micro-toasts efímeros y una única franja bloqueante descartable de 32 px cuando sea estrictamente necesario.
-
----
-
-## 1. Indicador Compacto de Sincronización en el Encabezado (`SyncStatusChip`)
-
-Se elimina el banner apilado de la parte superior. En su lugar, se incorpora en el encabezado (`<header>`), junto a los botones actuales (modo claro/oscuro, ajustes, etc.), un botón/chip de 36 a 40 px:
-
-### 1.1 Estados Visuales del Chip (36-40 px)
-1. **Gris con Check (Sincronizado / Idle)**:
-   - Icono: `Cloud` con un pequeño `Check` sutil.
-   - Aspecto: Color neutro/gris tenue (`text-neutral-400 hover:text-neutral-600 bg-neutral-100 dark:bg-neutral-800`).
-   - Comportamiento: Puede atenuarse u ocultarse tras unos segundos si no hay actividad, manteniéndose discreto.
-2. **Azul con Giro (Sincronizando / Subiendo)**:
-   - Icono: `Loader2` o `RefreshCw` girando suavemente (`animate-spin`) con nube azul (`text-blue-500 bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800`).
-   - Feedback: Indica que el motor de fotos o Firestore está transfiriendo datos activamente.
-3. **Ámbar con Número de Fotos Pendientes**:
-   - Icono: `CloudUpload` en ámbar con un badge numérico compacto integrado (ej. `3`, `12`).
-   - Aspecto: Fondo cálido suave (`bg-amber-50 text-amber-700 dark:bg-amber-950/40 dark:text-amber-300 border border-amber-200`).
-4. **Rojo con Signo de Exclamación (!) (Atención Requerida)**:
-   - Icono: `AlertTriangle` o `CloudAlert` con `!` en rojo/escarlata (`bg-red-50 text-red-600 dark:bg-red-950/40 dark:text-red-400 border border-red-200 animate-pulse`).
-   - Se activa ante cuota alcanzada de Firestore o Storage, o errores persistentes de permisos.
-
-### 1.2 Integración de Modo Limitado y Datos Guardados (Sin Banner Fijo)
-- Ni el modo limitado ni el aviso de lectura desde caché tendrán banners fijos ni etiquetas grandes en el header.
-- Se representan mediante un **punto indicador (dot)** sobre el chip:
-  - **Punto Ámbar pulsante**: Modo limitado o lectura desde caché telefónica.
-  - **Icono WifiOff diminuto** en la esquina del chip cuando `!isOnline`.
+Este plan detalla la arquitectura e integración del componente **ContinuousCamera** para permitir la captura ininterrumpida y secuencial de fotografías dentro de la aplicación con un solo toque, manteniendo intacta la lógica de almacenamiento local en IndexedDB y la cola de sincronización.
 
 ---
 
-## 2. Hoja Inferior de Detalle (`SyncStatusSheet`)
+## 1. Nuevo Flujo de Apertura Directa
 
-Al tocar el `SyncStatusChip`, se despliega una hoja inferior (*Bottom Sheet*) accesible, suavemente animada desde el borde inferior de la pantalla con fondo atenuado (*backdrop blur*):
-
-### 2.1 Contenido de la Hoja Inferior
-- **Cabecera y Cierre**:
-  - Título: *"Estado de Sincronización"* y botón de cierre `X` (o arrastre/tap fuera).
-- **Indicadores de Estado**:
-  - **Conexión**: *"Conectado a Internet"* (verde) o *"Sin conexión (Modo fuera de línea)"* (ámbar con icono `WifiOff`).
-  - **Base de Datos / Modo**:
-    - Si el interruptor de Firestore está activo: *"Límite de Firebase alcanzado: la app guarda cambios localmente en el teléfono"*.
-    - Si está en modo limitado: *"Modo limitado: operando con datos locales del dispositivo"*.
-    - Si está normal: *"Base de datos sincronizada"*.
-  - **Fotografías Pendientes**:
-    - Si `count === 0`: *"Todas las fotos están sincronizadas en la nube ✓"*.
-    - Si `count > 0`: *"{N} fotos pendientes de subir. Se subirán cuando abras la app con conexión"*.
-  - **Último Motivo de Error**:
-    - Redacción en lenguaje natural, simple y comprensible (ej. *"Límite de almacenamiento de fotos alcanzado: se intentará más tarde"*, *"Conexión inestable con el servidor"*).
-  - **Hora del Último Intento**:
-    - Formateado comprensible (ej. *"Último intento: 15:42 (hace 8 min)"*).
-- **Acciones Directas**:
-  - **[Reintentar ahora]**:
-    - Si hay cuota o error pausado, resetea el enfriamiento de Firestore y/o Storage y fuerza un reintento manual inmediato.
-  - **[Ver fotos pendientes]**:
-    - Abre un visor/modal rápido o filtra la lista de inventarios para ver los registros con fotografías pendientes de subida en cola.
-  - **Independencia**:
-    - La hoja refleja con precisión si el problema es de Storage, de Firestore o de red, sin interferir entre ellos.
+### 1.1 Eliminación del paso intermedio `photoSourceModal`
+- Al presionar **"+ Añadir fotos"** o el botón de cámara en cualquier **espacio** del inventario o en la sección de **anexos**:
+  - Ya **no** se mostrará la ventana flotante `photoSourceModal` (que forzaba a elegir entre Cámara o Galería).
+  - Se abrirá directamente a pantalla completa el nuevo componente `ContinuousCamera`.
+  - Se pasa el destino activo: `{ type: 'space' | 'annex', spaceId?: string, spaceName?: string }`.
+  - Las opciones alternativas (Galería y Cámara del sistema nativa) estarán accesibles directamente desde la propia interfaz de `ContinuousCamera` mediante botones dedicados en la barra de herramientas.
 
 ---
 
-## 3. Toasts Puntuales No Repetitivos (Inferiores, 3 a 4 s)
+## 2. Componente `ContinuousCamera` (`src/components/ContinuousCamera.tsx`)
 
-Los eventos informativos y cambios de estado puntuales se notifican mediante micro-toasts flotantes:
-- **Posición**: En la parte inferior de la pantalla, flotando sobre la barra de navegación o controles inferiores (`bottom-6` en escritorio, `bottom-20` en móvil si hay tabs).
-- **Duración**: Se desvanecen automáticamente tras **3 a 4 segundos**.
-- **Contenido conciso**:
-  - Ejemplo de subida: *"18 fotos subidas ✓"*
-  - Ejemplo de reconexión: *"Conexión restablecida ✓"*
-- **Prevención de bucles y fatiga (Anti-spam)**:
-  - Registro en memoria del último toast de error emitido y su código/mensaje.
-  - **Regla estricta**: No repetir el mismo toast de error más de una vez por episodio (mientras persista la misma condición o durante la ventana de enfriamiento).
+Se creará un componente dedicado, optimizado para dispositivos móviles y escritorio, con diseño a pantalla completa sobre fondo negro inmersivo.
 
----
+### 2.1 Captura de Video y Hardware
+- **Stream de Cámara**:
+  - Invocación con restricciones óptimas:
+    ```ts
+    navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: { ideal: 'environment' },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 }
+      },
+      audio: false
+    })
+    ```
+  - Renderizado en `<video ref={videoRef} playsInline muted autoPlay className="w-full h-full object-cover" />`.
+- **Detección de Linterna (Torch)**:
+  - Al iniciar el stream, inspecciona `track.getCapabilities?.().torch`.
+  - Si está soportado, habilita un botón de linterna que alterna `track.applyConstraints({ advanced: [{ torch: isTorchOn }] })`.
 
-## 4. Franja Fija Única Descartable (Máx. 32 px) Solo para Errores Bloqueantes
-
-- **Condición Estricta de Aparición**:
-  - Se reserva **exclusivamente** para situaciones críticas donde el usuario no puede cargar datos ni continuar trabajando con normalidad (por ejemplo: límite diario de Firestore alcanzado sin caché previa disponible, o error crítico de autenticación).
-- **Diseño Ultra-Compacto**:
-  - Altura máxima: **32 px**.
-  - **Una sola línea de texto** con `truncate` o texto condensado (ej. *"Límite diario alcanzado: datos guardados en el teléfono"*).
-  - **Botón de descarte (X)** en el extremo derecho: el usuario puede cerrarlo inmediatamente con un toque y no vuelve a aparecer durante la sesión actual a menos que ocurra un evento crítico nuevo.
-  - **Restricción total**: Nunca más de una franja simultánea, nunca textos en dos líneas, y nunca barras apiladas.
-
----
-
-## 5. Corrección de Redacción en Textos
-
-Se auditan y reemplazan todas las referencias en la interfaz:
-- ❌ *"en segundo plano"*
-- ❌ *"se sincronizarán automáticamente en segundo plano"*
-- ✅ **"Se subirán cuando abras la app con conexión"**
-
-Aplicado de forma consistente en:
-- Hoja inferior de sincronización (`SyncStatusSheet`).
-- Diálogos de confirmación al guardar inventarios con fotos pendientes.
-- Mensajes informativos de finalización de actas o inspecciones.
+### 2.2 Disparo Instantáneo y Retroalimentación
+- **Botón de Disparo**:
+  - Botón circular prominente y centrado en la parte inferior (diámetro 72-80 px) con aro exterior y pulsación táctil responsiva.
+- **Mecanismo de Captura Ultra-Rápida**:
+  1. Si `window.ImageCapture` está disponible en el `videoTrack`, se utiliza `imageCapture.takePhoto()` para obtener el fotograma con resolución nativa del sensor.
+  2. Si no está soportado o falla, se dibuja de inmediato el fotograma actual del `<video>` en un `<canvas width={videoWidth} height={videoHeight}>` y se genera el Blob JPEG vía `canvas.toBlob(..., 'image/jpeg', 0.92)`.
+  3. La cámara **no se cierra ni se bloquea**; permanece lista inmediatamente para el siguiente disparo.
+- **Retroalimentación Inmediata**:
+  - **Destello de pantalla**: Capa blanca semitransparente con animación de flash (`100ms`).
+  - **Vibración háptica**: `if ('vibrate' in navigator) navigator.vibrate(15);`.
 
 ---
 
-## 6. Arquitectura y Componentes a Implementar
+## 3. Cola de Procesamiento y Persistencia Unificada
 
-| Componente / Archivo | Responsabilidad |
+### 3.1 Función Compartida `addPhotosToTarget`
+Se extrae la lógica común de procesamiento de imágenes de `handlePhotoCapture` y `handleAnnexPhotoCapture` hacia una función reutilizable:
+```ts
+addPhotosToTarget(
+  files: File[], 
+  target: { type: 'space' | 'annex'; spaceId?: string }
+): Promise<Photo[]>
+```
+- Realiza el redimensionamiento estándar (máx. 900px, JPEG compresión), genera el ID único, guarda el Blob en IndexedDB (`offlinePhotoDb`) con estado `pending`, y retorna el objeto liviano `Photo`.
+- Actualiza de forma segura el estado de React (`currentInventory.spaces` o `annexPhotos`).
+- Es utilizada tanto por `ContinuousCamera` como por los inputs de archivo tradicionales (`cameraInputRef`, `galleryInputRef`, `annexCameraInputRef`, `annexGalleryInputRef`).
+
+### 3.2 Cola Secuencial en Segundo Plano (Background Queue)
+- En `ContinuousCamera`, cada disparo convierte el Blob capturado en un `File` (`photo_timestamp_uuid.jpg`) y lo añade a una cola en memoria (`queueRef`).
+- Un despachador asíncrono procesa las fotos **de una en una** llamando a `addPhotosToTarget([file], target)`.
+- **Beneficios**:
+  - El usuario puede presionar el obturador tantas veces como desee sin lag ni congelamiento del visor.
+  - Evita picos de consumo de memoria RAM en dispositivos de gama media o baja.
+  - Al completar cada foto, se actualiza el contador de la sesión y la miniatura activa.
+
+---
+
+## 4. Interfaz de Usuario de `ContinuousCamera`
+
+- **Barra Superior**:
+  - Título con el nombre del espacio actual (ej. *"Cocina"*, *"Dormitorio Principal"*, o *"Anexo"*).
+  - Contador dinámico: `"{N} fotos tomadas"`.
+  - Botón de **Linterna** (condicional según capacidades del dispositivo).
+  - Botón **"Listo" / Cerrar**: Cierra la cámara y vuelve al inventario; todas las fotos tomadas en la sesión quedan conservadas.
+- **Barra Inferior**:
+  - **Centro**: Botón de obturador grande.
+  - **Izquierda**: Miniatura de la última foto tomada en la sesión actual:
+    - Debajo o junto a ella, botón **"Deshacer"**: elimina exclusivamente la última foto tomada en esta sesión (usando `removePhoto` o `removeAnnexPhoto`), liberando el Blob de IndexedDB y retrocediendo la miniatura y el contador.
+  - **Acciones Rápidas Alternativas**:
+    - Botón **"Galería"**: Invoca `galleryInputRef.current?.click()` permitiendo seleccionar fotos del carrete sin fricción.
+    - Botón **"Cámara del sistema"**: Invoca `cameraInputRef.current?.click()` para aquellos casos donde el usuario prefiera la app nativa de su teléfono.
+
+---
+
+## 5. Manejo de Errores y Fallback Automático
+
+- Si `navigator.mediaDevices?.getUserMedia` no existe (navegadores antiguos o entornos no compatibles) o el usuario deniega el permiso de cámara (`NotAllowedError` / `PermissionDeniedError`):
+  1. Cierra `ContinuousCamera` limpiamente.
+  2. Muestra un toast breve: *"Permiso de cámara denegado o no disponible. Abriendo cámara del sistema..."*.
+  3. Dispara automáticamente el click de `cameraInputRef` (o `annexCameraInputRef`), asegurando que el usuario pueda tomar fotos sin perder el destino actual.
+
+---
+
+## 6. Ciclo de Vida y Resiliencia en Android/Web
+
+1. **Liberación de Hardware**:
+   - Detiene todos los `MediaStreamTrack` (`track.stop()`) al cerrar la cámara o al desmontar el componente.
+2. **Segundo Plano (`visibilitychange`)**:
+   - Escucha `document.addEventListener('visibilitychange', ...)`:
+     - Si la pestaña o aplicación se oculta (`visibilityState === 'hidden'`), apaga los tracks de video para ahorrar batería y no bloquear el hardware del teléfono.
+     - Al volver al primer plano (`visibilityState === 'visible'`), reactiva el stream si el visor sigue abierto.
+3. **Botón Atrás de Android (Integración con Historial)**:
+   - Al abrir `ContinuousCamera`, ejecuta `window.history.pushState({ continuousCamera: true }, '')`.
+   - Escucha el evento `popstate`: si el usuario presiona el botón físico o gesto de "Atrás" de Android, cierra la cámara sin salir del inventario.
+   - Al pulsar "Listo" o cerrar manualmente, si el estado de historial fue insertado, se ejecuta `window.history.back()`.
+4. **Limpieza de Recursos**:
+   - Revocación de URLs temporales creadas para las miniaturas mediante `URL.revokeObjectURL(...)`.
+
+---
+
+## 7. Archivos a Modificar / Crear
+
+| Archivo | Cambios Planificados |
 | :--- | :--- |
-| `src/components/SyncStatusChip.tsx` *(Nuevo)* | Botón compacto de 36-40 px para el header con 4 estados visuales (gris con check, azul girando, ámbar con conteo, rojo con !), badge de modo limitado y evento de apertura. |
-| `src/components/SyncStatusSheet.tsx` *(Nuevo)* | Hoja inferior animada con backdrop: conexión, fotos pendientes, texto explicativo ("Se subirán cuando abras la app con conexión"), último error, hora, botón "Reintentar ahora" y "Ver fotos pendientes". |
-| `src/components/UnifiedStatusBanner.tsx` | Reducción/reemplazo a franja única descartable de máx. 32 px para errores críticos bloqueantes de una línea. |
-| `src/App.tsx` | - Integración del `SyncStatusChip` en `<header>` junto a controles de tema/ajustes.<br>- Supresión del banner superior fijo apilado y del badge voluminoso de modo limitado.<br>- Lógica de toasts efímeros inferiores (3-4 s) con deduplicación.<br>- Actualización de textos a *"Se subirán cuando abras la app con conexión"*. |
+| `src/components/ContinuousCamera.tsx` *(Nuevo)* | Componente de cámara continua a pantalla completa: getUserMedia, ImageCapture/canvas fallback, destello/vibración, cola secuencial, linterna, miniatura con deshacer, accesos a galería y cámara de sistema. |
+| `src/App.tsx` | - Extraer `addPhotosToTarget` a partir de `handlePhotoCapture` y `handleAnnexPhotoCapture`.<br>- Actualizar los disparadores de "+ Añadir foto" para abrir directamente `ContinuousCamera`.<br>- Montar `ContinuousCamera` en el árbol de componentes.<br>- Mantener intactos los inputs ocultos de archivo y funciones auxiliares. |
 
 ---
 
-## 7. Plan de Verificación
+## 8. Verificación y Pruebas
 
-1. **Espacio en Pantalla**: Verificar que el viewport útil de la pantalla no tiene banners apilados fijos y que la barra de navegación se mantiene limpia.
-2. **Estados del Chip**:
-   - Simular sincronización activa -> chip azul girando.
-   - Fotos en cola -> chip ámbar con número.
-   - Error de cuota Storage o Firestore -> chip rojo con "!".
-   - Todo completado -> gris tenue con check.
-3. **Interacción con Bottom Sheet**:
-   - Tocar el chip -> despliegue suave de la hoja inferior.
-   - Comprobar que muestra el último intento, motivo claro y los botones funcionales "Reintentar ahora" y "Ver fotos pendientes".
-4. **Toasts**:
-   - Verificar aparición inferior, desaparición a los 3.5 segundos y no repetición de toasts de error idénticos.
-5. **Franja Bloqueante**:
-   - En caso de bloqueo crítico de Firestore, verificar que ocupa máximo 32 px en una línea y que el botón `X` la descarta.
-6. **Compilación y Linteo**:
-   - Verificar `compile_applet` y `lint_applet` sin errores, manteniendo compatibilidad con `android-patch.py`.
+1. **Ráfaga de Captura**: Disparar 5-10 fotos en rápida sucesión; verificar que no hay bloqueos de UI, que el contador sube en tiempo real y que el destello/vibración ocurre en cada disparo.
+2. **Acción Deshacer**: Tomar fotos, pulsar "Deshacer" y comprobar que solo se elimina la última capturada en IndexedDB y del estado visual.
+3. **Persistencia & Cola**: Comprobar que al cerrar la cámara ("Listo"), todas las fotos tomadas aparecen listadas en el espacio correspondiente con la etiqueta "Local" listas para sincronizar.
+4. **Fallback de Permisos**: Probar bloqueo o no disponibilidad de `getUserMedia` y comprobar que abre la cámara del sistema con un toast explicativo.
+5. **Ciclo de Vida y Botón Atrás**: Comprobar que minimizar la app apaga la cámara, que el botón atrás de Android cierra la cámara limpiamente y que la linterna funciona si el hardware lo soporta.
+6. **Compilación y Linteo**: Ejecutar `compile_applet` y `lint_applet` con 0 errores, y validar compatibilidad con `android-patch.py`.

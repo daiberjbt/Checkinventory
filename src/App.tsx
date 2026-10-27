@@ -143,6 +143,7 @@ import {
 import { SyncStatusChip } from './components/SyncStatusChip';
 import { SyncStatusSheet } from './components/SyncStatusSheet';
 import { CriticalBlockingBanner } from './components/CriticalBlockingBanner';
+import { ContinuousCamera } from './components/ContinuousCamera';
 import { buildSearchTokens, computeIsReceived, computeIsAssigned, normalizeText } from './lib/searchTokens';
 import { ref, uploadBytesResumable, getDownloadURL, deleteObject } from 'firebase/storage';
 import ReactQuill from 'react-quill-new';
@@ -605,6 +606,12 @@ export default function App() {
 
   // Mobile / Android Optimizations
   const [isOnline, setIsOnline] = useState<boolean>(navigator.onLine);
+  const [continuousCamera, setContinuousCamera] = useState<{
+    open: boolean;
+    target: 'space' | 'annex';
+    spaceId?: string;
+    spaceTitle?: string;
+  }>({ open: false, target: 'space' });
   const [photoSourceModal, setPhotoSourceModal] = useState<{ open: boolean; spaceId?: string; type: 'space' | 'annex' }>({ open: false, type: 'space' });
   const [fullscreenPhoto, setFullscreenPhoto] = useState<{ url: string; title: string; date?: string; spaceId?: string; photoId?: string; canDelete?: boolean; isAnnex?: boolean } | null>(null);
 
@@ -3526,75 +3533,89 @@ export default function App() {
     };
   };
 
-  const handlePhotoCapture = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const addPhotosToTarget = async (
+    files: File[],
+    target: { type: 'space' | 'annex'; spaceId?: string }
+  ): Promise<Photo[]> => {
     if (!isSubscriptionActive()) {
       showNotify('Tu licencia temporal ha vencido. Activa un código de 6 meses para añadir fotos.', 'error');
-      return;
+      return [];
     }
     if (!currentInventory || currentInventory.status !== 'draft') {
       showNotify('No se pueden añadir fotos a un documento firmado o archivado.', 'error');
-      return;
+      return [];
     }
-    const files = e.target.files;
-    if (!files || !targetSpaceId || !currentUser) return;
+    if (!currentUser || files.length === 0) return [];
 
-    const effectiveAdminEmail = resolveAdminEmail(currentUser);
-    if (!effectiveAdminEmail) {
-      showNotify('No se pudo identificar la agencia administradora.', 'error');
-      return;
-    }
-
-    const fileList: File[] = Array.from(files);
-    if (e.target) e.target.value = '';
-    if (fileList.length === 0) return;
-
-    setIsUploadingPhotos(true);
-    showNotify(`Procesando ${fileList.length} fotografía(s)...`, 'info', 4000);
+    const isAnnex = target.type === 'annex';
+    const effectiveSpaceId = isAnnex ? undefined : target.spaceId;
+    if (!isAnnex && !effectiveSpaceId) return [];
 
     const newPhotos: Photo[] = [];
     const failedFiles: string[] = [];
 
-    try {
-      // Step A: Compress to Blob JPEG (MAX_DIM=900, quality=0.55), save to IndexedDB queue, return light Photo
-      for (const file of fileList) {
-        try {
-          const result = await uploadPhotoWithFallback(file, currentUser.id, currentInventory.id, targetSpaceId, false);
-          newPhotos.push(result.photo);
-        } catch (err: any) {
-          console.error(`Error processing photo ${file.name}:`, err);
-          failedFiles.push(file.name);
-        }
+    for (const file of files) {
+      try {
+        const result = await uploadPhotoWithFallback(
+          file, 
+          currentUser.id, 
+          currentInventory.id, 
+          effectiveSpaceId, 
+          isAnnex
+        );
+        newPhotos.push(result.photo);
+      } catch (err: any) {
+        console.error(`Error processing photo ${file.name}:`, err);
+        failedFiles.push(file.name);
       }
+    }
 
-      if (newPhotos.length === 0) {
-        throw new Error(`No se pudo procesar ninguna imagen. ${failedFiles.join(', ')}`);
+    if (newPhotos.length === 0) {
+      if (failedFiles.length > 0) {
+        showNotify(`Error al procesar: ${failedFiles.join(', ')}`, 'error');
       }
+      return [];
+    }
 
-      // Step B: Build final spaces state with newly added photos (safe arrays)
+    if (isAnnex) {
+      setAnnexPhotos(prev => [...prev, ...newPhotos]);
+    } else {
       const updatedSpaces = (currentInventory.spaces || []).map(s => {
-        if (s.id === targetSpaceId) {
+        if (s.id === effectiveSpaceId) {
           const existingPhotos = Array.isArray(s.photos) ? s.photos : [];
           return { ...s, photos: [...existingPhotos, ...newPhotos] };
         }
         return s;
       });
 
-      // Step C: Update React state immediately for instant UI display via PhotoThumb with badge "Local"
-      setCurrentInventory(prev => {
-        if (!prev) return null;
-        return { ...prev, spaces: updatedSpaces };
-      });
+      setCurrentInventory(prev => prev ? { ...prev, spaces: updatedSpaces } : null);
       setInventories(prev => prev.map(inv => 
         inv.id === currentInventory.id ? { ...inv, spaces: updatedSpaces } : inv
       ));
+    }
 
-      // Note: Photos stay safely in IndexedDB with status 'pending' (showing "Local").
-      // Sincronización ordenada a Firestore se iniciará una vez que saveInventory() confirme la persistencia.
+    if (failedFiles.length > 0) {
+      showNotify(`Se procesaron ${newPhotos.length} foto(s). Fallaron: ${failedFiles.join(', ')}`, 'warning');
+    }
 
-      if (failedFiles.length > 0) {
-        showNotify(`Se procesaron ${newPhotos.length} foto(s). Fallaron: ${failedFiles.join(', ')}`, 'warning');
-      } else {
-        showNotify(`${newPhotos.length} fotografía(s) guardada(s) localmente y listas para sincronización`, 'success');
+    return newPhotos;
+  };
+
+  const handlePhotoCapture = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || !targetSpaceId || !currentUser) return;
+
+    const fileList: File[] = Array.from(files);
+    if (e.target) e.target.value = '';
+    if (fileList.length === 0) return;
+
+    setIsUploadingPhotos(true);
+    showNotify(`Procesando ${fileList.length} fotografía(s)...`, 'info', 3000);
+
+    try {
+      const added = await addPhotosToTarget(fileList, { type: 'space', spaceId: targetSpaceId });
+      if (added.length > 0) {
+        showNotify(`${added.length} fotografía(s) guardada(s) localmente y listas para sincronización`, 'success');
       }
     } catch (err: any) {
       console.error('Error during photo upload process:', err);
@@ -3764,25 +3785,24 @@ export default function App() {
   };
 
   const handleAnnexPhotoCapture = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (!isSubscriptionActive()) {
-      showNotify('Tu suscripción ha vencido. Renueva para añadir fotos.', 'error');
-      return;
-    }
     const files = e.target.files;
-    if (!files || !currentUser || !currentInventory) return;
+    if (!files) return;
 
     const fileList: File[] = Array.from(files);
     if (e.target) e.target.value = '';
     if (fileList.length === 0) return;
 
-    for (const file of fileList) {
-      try {
-        const result = await uploadPhotoWithFallback(file, currentUser.id, currentInventory.id, undefined, true);
-        setAnnexPhotos(prev => [...prev, result.photo]);
-      } catch (err: any) {
-        console.error('Error processing annex image:', err);
-        showNotify(`Error al procesar foto del anexo: ${err?.message || ''}`, 'error');
+    setIsUploadingPhotos(true);
+    try {
+      const added = await addPhotosToTarget(fileList, { type: 'annex' });
+      if (added.length > 0) {
+        showNotify(`${added.length} foto(s) de anexo añadidas`, 'success');
       }
+    } catch (err: any) {
+      console.error('Error processing annex image:', err);
+      showNotify(`Error al procesar foto del anexo: ${err?.message || ''}`, 'error');
+    } finally {
+      setIsUploadingPhotos(false);
     }
   };
 
@@ -5586,7 +5606,7 @@ export default function App() {
                       </div>
                     ))}
                     <button 
-                      onClick={() => setPhotoSourceModal({ open: true, type: 'annex' })}
+                      onClick={() => setContinuousCamera({ open: true, target: 'annex', spaceTitle: 'Fotografías del Anexo' })}
                       className="aspect-square border-2 border-dashed border-black/5 rounded-xl flex flex-col items-center justify-center text-muted hover:bg-black/[0.02] transition-all"
                     >
                       <Plus size={20} />
@@ -9207,7 +9227,12 @@ export default function App() {
                                 <button 
                                   onClick={() => {
                                     setTargetSpaceId(space.id);
-                                    setPhotoSourceModal({ open: true, spaceId: space.id, type: 'space' });
+                                    setContinuousCamera({
+                                      open: true,
+                                      target: 'space',
+                                      spaceId: space.id,
+                                      spaceTitle: space.title || 'Espacio'
+                                    });
                                   }}
                                   className="text-xs font-bold flex items-center gap-2 text-black hover:opacity-70 transition-all bg-black/5 px-3 py-1.5 rounded-xl"
                                 >
@@ -9228,12 +9253,17 @@ export default function App() {
                                     <div 
                                       onClick={() => {
                                         setTargetSpaceId(space.id);
-                                        setPhotoSourceModal({ open: true, spaceId: space.id, type: 'space' });
+                                        setContinuousCamera({
+                                          open: true,
+                                          target: 'space',
+                                          spaceId: space.id,
+                                          spaceTitle: space.title || 'Espacio'
+                                        });
                                       }}
                                       className="border-2 border-dashed border-black/5 rounded-2xl p-10 text-center cursor-pointer hover:bg-black/[0.02] transition-all"
                                     >
                                       <Camera size={24} className="mx-auto mb-2 opacity-20" />
-                                      <p className="text-[10px] text-muted font-bold uppercase tracking-wider">Añadir fotos (Cámara o Galería)</p>
+                                      <p className="text-[10px] text-muted font-bold uppercase tracking-wider">Añadir fotos (Cámara continua)</p>
                                     </div>
                                   );
                                 }
@@ -9281,7 +9311,12 @@ export default function App() {
                                       <button 
                                         onClick={() => {
                                           setTargetSpaceId(space.id);
-                                          setPhotoSourceModal({ open: true, spaceId: space.id, type: 'space' });
+                                          setContinuousCamera({
+                                            open: true,
+                                            target: 'space',
+                                            spaceId: space.id,
+                                            spaceTitle: space.title || 'Espacio'
+                                          });
                                         }}
                                         className="aspect-square border-2 border-dashed border-black/5 rounded-xl flex flex-col items-center justify-center text-muted hover:bg-black/[0.02] transition-all"
                                       >
@@ -9777,6 +9812,55 @@ export default function App() {
           showNotify(`${globalPendingPhotos.length} fotos pendientes de subir. Se subirán cuando abras la app con conexión.`, 'info');
         }}
         isRetrying={isRetryingSync}
+      />
+
+      {/* In-App Continuous Shutter Camera */}
+      <ContinuousCamera
+        isOpen={continuousCamera.open}
+        targetTitle={continuousCamera.spaceTitle || (continuousCamera.target === 'annex' ? 'Anexo' : 'Espacio')}
+        onClose={() => setContinuousCamera(prev => ({ ...prev, open: false }))}
+        onCapturePhoto={async (file) => {
+          const res = await addPhotosToTarget([file], {
+            type: continuousCamera.target,
+            spaceId: continuousCamera.spaceId
+          });
+          return res[0] || null;
+        }}
+        onUndoPhoto={async (photoId) => {
+          if (continuousCamera.target === 'annex') {
+            await removeAnnexPhoto(photoId);
+          } else if (continuousCamera.spaceId) {
+            await removePhoto(continuousCamera.spaceId, photoId);
+          }
+        }}
+        onOpenGallery={() => {
+          if (continuousCamera.target === 'annex') {
+            annexGalleryInputRef.current?.click();
+          } else {
+            if (continuousCamera.spaceId) setTargetSpaceId(continuousCamera.spaceId);
+            galleryInputRef.current?.click();
+          }
+        }}
+        onOpenSystemCamera={() => {
+          if (continuousCamera.target === 'annex') {
+            annexCameraInputRef.current?.click();
+          } else {
+            if (continuousCamera.spaceId) setTargetSpaceId(continuousCamera.spaceId);
+            cameraInputRef.current?.click();
+          }
+        }}
+        onErrorFallback={(msg) => {
+          setContinuousCamera(prev => ({ ...prev, open: false }));
+          showNotify(msg, 'warning', 4000);
+          setTimeout(() => {
+            if (continuousCamera.target === 'annex') {
+              annexCameraInputRef.current?.click();
+            } else {
+              if (continuousCamera.spaceId) setTargetSpaceId(continuousCamera.spaceId);
+              cameraInputRef.current?.click();
+            }
+          }, 150);
+        }}
       />
     </div>
   );
