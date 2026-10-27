@@ -12,6 +12,7 @@ import json
 import os
 import pathlib
 import re
+import subprocess
 import sys
 
 ROOT = pathlib.Path('.')
@@ -67,6 +68,19 @@ SIGNING_GRADLE = """    signingConfigs {
 """
 
 
+STAT_ICON_XML = """<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M19.35,10.04C18.67,6.59 15.64,4 12,4 9.11,4 6.6,5.64 5.35,8.04 2.34,8.36 0,10.91 0,14c0,3.31 2.69,6 6,6h13c2.76,0 5,-2.24 5,-5 0,-2.64 -2.05,-4.78 -4.65,-4.96zM14,13v4h-4v-4H7l5,-5 5,5h-3z" />
+</vector>
+"""
+
+
 def android_post():
     import shutil
     failed = []
@@ -101,6 +115,16 @@ def android_post():
     else:
         print('  (aviso) falta checkinventory-debug.keystore en la raiz del repositorio: el APK se firmara con una llave temporal')
         print('          distinta en cada compilacion y habra que desinstalar la version anterior para instalarlo.')
+    # 2b) Icono de la notificacion de recordatorio (blanco sobre transparente, como exige Android)
+    icon_dir = pathlib.Path('android/app/src/main/res/drawable')
+    icon_dir.mkdir(parents=True, exist_ok=True)
+    icon_file = icon_dir / 'ic_stat_checkinventory.xml'
+    if not icon_file.exists():
+        icon_file.write_text(STAT_ICON_XML, encoding='utf-8')
+        print('+ icono de notificacion creado')
+    else:
+        print('= icono de notificacion ya estaba')
+
     # 3) Numero de version creciente (numero de ejecucion de GitHub): Android lo acepta como actualizacion
     run = os.environ.get('GITHUB_RUN_NUMBER', '').strip()
     if run.isdigit():
@@ -131,6 +155,7 @@ import { SpeechRecognition } from '@capacitor-community/speech-recognition';
 import type JSZip from 'jszip';
 import firebaseConfig from '../firebase-applet-config.json';
 import { streamZipBase64 } from './zipStream';
+import { startPhotoReminders } from './reminders';
 
 export const isNative = Capacitor.isNativePlatform();
 
@@ -266,6 +291,13 @@ if (isNative) {
     });
   }
 
+  // 1c) Recordatorio local cuando quedan fotos sin subir (no necesita internet ni servidor)
+  try {
+    void startPhotoReminders();
+  } catch (e) {
+    console.warn('Recordatorios no disponibles', e);
+  }
+
   // 2) navigator.share / canShare no existen en el WebView: se reemplazan por el menu nativo de Android
   const nav = navigator as any;
   nav.canShare = () => true;
@@ -355,6 +387,261 @@ export function streamZipBase64(
 }
 """
 
+REMINDERS_TS = r"""import { App } from '@capacitor/app';
+import { LocalNotifications } from '@capacitor/local-notifications';
+
+// Recordatorio local: avisa cuando quedan fotos sin subir a la nube.
+// Las fotos solo se suben con la app abierta. Si el usuario la cierra con fotos pendientes,
+// Android muestra un aviso mas tarde. Se cancela solo al volver a abrir la app.
+
+const DB_NAME = 'CheckInventoryLocalDB';
+const STORE_NAME = 'photo_sync_queue';
+const PENDING_STATUSES = ['pending', 'uploading', 'failed'];
+const CHANNEL_ID = 'sync_reminders';
+const REMINDER_IDS = [91001, 91002, 91003];
+const DELAYS_HOURS = [2, 24, 72];
+const ASKED_KEY = 'ci_notif_permission_asked';
+
+export interface ReminderItem {
+  id: number;
+  at: Date;
+  title: string;
+  body: string;
+}
+
+/** Evita avisos de madrugada: entre las 21:00 y las 07:00 se mueve a las 08:00. */
+export function adjustForQuietHours(date: Date): Date {
+  const d = new Date(date.getTime());
+  const h = d.getHours();
+  if (h >= 21) {
+    d.setDate(d.getDate() + 1);
+    d.setHours(8, 0, 0, 0);
+  } else if (h < 7) {
+    d.setHours(8, 0, 0, 0);
+  }
+  return d;
+}
+
+export function buildReminders(count: number, now: Date): ReminderItem[] {
+  const one = count === 1;
+  const fotos = one ? '1 foto' : `${count} fotos`;
+  const bodies = [
+    `Tienes ${fotos} sin subir a la nube. Abre CheckInventory con internet para sincronizar${one ? 'la' : 'las'}.`,
+    `${one ? 'Sigue' : 'Siguen'} ${fotos} sin subir. Abre la app con internet para que no queden solo en tu teléfono.`,
+    `Aún hay ${fotos} sin subir. Si desinstalas la app o borras sus datos se perderán: ábrela con internet.`,
+  ];
+  return DELAYS_HOURS.map((hours, i) => ({
+    id: REMINDER_IDS[i],
+    at: adjustForQuietHours(new Date(now.getTime() + hours * 3600 * 1000)),
+    title: 'CheckInventory',
+    body: bodies[i],
+  }));
+}
+
+/**
+ * Cuenta las fotos que siguen solo en el teléfono. No abre la base de datos si no existe
+ * (abrirla sin la tabla la dejaria rota para la app).
+ */
+export async function countPendingPhotos(idb?: IDBFactory): Promise<number> {
+  const factory = idb ?? (typeof indexedDB !== 'undefined' ? indexedDB : undefined);
+  if (!factory) return 0;
+  try {
+    const anyFactory = factory as any;
+    if (typeof anyFactory.databases === 'function') {
+      const dbs = await anyFactory.databases();
+      if (!dbs.some((d: any) => d.name === DB_NAME)) return 0;
+    }
+  } catch {
+    /* seguimos con la apertura protegida */
+  }
+  return new Promise<number>((resolve) => {
+    let req: IDBOpenDBRequest;
+    try {
+      req = factory.open(DB_NAME);
+    } catch {
+      resolve(0);
+      return;
+    }
+    // Si la base no existia, se cancela su creacion para no dejarla sin la tabla de la app
+    req.onupgradeneeded = () => {
+      try {
+        req.transaction?.abort();
+      } catch {
+        /* nada */
+      }
+    };
+    req.onerror = () => resolve(0);
+    req.onblocked = () => resolve(0);
+    req.onsuccess = () => {
+      const db = req.result;
+      let total = 0;
+      try {
+        if (!db.objectStoreNames.contains(STORE_NAME)) {
+          db.close();
+          resolve(0);
+          return;
+        }
+        const tx = db.transaction(STORE_NAME, 'readonly');
+        const cursorReq = tx.objectStore(STORE_NAME).openCursor();
+        cursorReq.onsuccess = () => {
+          const cursor = cursorReq.result;
+          if (!cursor) return;
+          const v: any = cursor.value;
+          if (v && PENDING_STATUSES.includes(v.status) && !v.isDeleted) total++;
+          cursor.continue();
+        };
+        tx.oncomplete = () => {
+          db.close();
+          resolve(total);
+        };
+        tx.onerror = tx.onabort = () => {
+          db.close();
+          resolve(total);
+        };
+      } catch {
+        try {
+          db.close();
+        } catch {
+          /* nada */
+        }
+        resolve(0);
+      }
+    };
+  });
+}
+
+export interface ReminderDeps {
+  countPending(): Promise<number>;
+  schedule(items: ReminderItem[]): Promise<void>;
+  cancel(ids: number[]): Promise<void>;
+  permission(): Promise<string>;
+  requestPermission(): Promise<string>;
+  hasAsked(): boolean;
+  markAsked(): void;
+  now(): Date;
+}
+
+/** Logica pura (sin Capacitor) para poder probarla: cuando programar y cuando cancelar. */
+export function createReminderController(d: ReminderDeps) {
+  let lastCount = 0;
+  let scheduledCount = 0;
+  let queue: Promise<unknown> = Promise.resolve();
+  const enqueue = <T>(fn: () => Promise<T>): Promise<T> => {
+    const run = queue.then(fn, fn);
+    queue = run.catch(() => undefined);
+    return run;
+  };
+
+  const refresh = async () => {
+    lastCount = await d.countPending();
+    return lastCount;
+  };
+
+  const maybeAskPermission = async (count: number) => {
+    if (count <= 0 || d.hasAsked()) return;
+    const state = await d.permission();
+    if (state === 'prompt' || state === 'prompt-with-rationale') {
+      d.markAsked();
+      await d.requestPermission();
+    }
+  };
+
+  return {
+    /** La app vuelve al primer plano: ya no hace falta recordar nada. */
+    onForeground: () =>
+      enqueue(async () => {
+        await d.cancel(REMINDER_IDS);
+        scheduledCount = 0;
+        await maybeAskPermission(await refresh());
+      }),
+    /** Cada minuto con la app abierta: mantiene el conteo al dia y pide permiso la primera vez. */
+    tick: () =>
+      enqueue(async () => {
+        await maybeAskPermission(await refresh());
+      }),
+    /** La app pasa a segundo plano o se cierra: si hay fotos pendientes, programa los avisos. */
+    onBackground: () =>
+      enqueue(async () => {
+        if ((await d.permission()) !== 'granted') return;
+        // Se programa de inmediato con el ultimo conteo (el sistema puede congelar la app enseguida)...
+        if (lastCount > 0) {
+          await d.schedule(buildReminders(lastCount, d.now()));
+          scheduledCount = lastCount;
+        }
+        // ...y se corrige con el conteo real
+        const n = await refresh();
+        if (n === 0) {
+          await d.cancel(REMINDER_IDS);
+          scheduledCount = 0;
+        } else if (n !== scheduledCount) {
+          await d.schedule(buildReminders(n, d.now()));
+          scheduledCount = n;
+        }
+      }),
+  };
+}
+
+export async function startPhotoReminders(): Promise<void> {
+  try {
+    await LocalNotifications.createChannel({
+      id: CHANNEL_ID,
+      name: 'Recordatorios de sincronización',
+      description: 'Avisos cuando hay fotos sin subir a la nube',
+      importance: 3,
+      visibility: 1,
+    });
+  } catch {
+    /* el canal es opcional */
+  }
+
+  const controller = createReminderController({
+    countPending: () => countPendingPhotos(),
+    schedule: async (items) => {
+      await LocalNotifications.cancel({ notifications: REMINDER_IDS.map((id) => ({ id })) });
+      await LocalNotifications.schedule({
+        notifications: items.map((i) => ({
+          id: i.id,
+          title: i.title,
+          body: i.body,
+          channelId: CHANNEL_ID,
+          schedule: { at: i.at, allowWhileIdle: true },
+          // Alarma inexacta: evita que Android abra la pantalla "Alarmas y recordatorios"
+          isExactNotification: false,
+          extra: { type: 'photo-sync-reminder' },
+        })),
+      });
+    },
+    cancel: (ids) => LocalNotifications.cancel({ notifications: ids.map((id) => ({ id })) }),
+    permission: async () => (await LocalNotifications.checkPermissions()).display,
+    requestPermission: async () => (await LocalNotifications.requestPermissions()).display,
+    hasAsked: () => {
+      try {
+        return localStorage.getItem(ASKED_KEY) === '1';
+      } catch {
+        return false;
+      }
+    },
+    markAsked: () => {
+      try {
+        localStorage.setItem(ASKED_KEY, '1');
+      } catch {
+        /* nada */
+      }
+    },
+    now: () => new Date(),
+  });
+
+  const safe = (p: Promise<unknown>) => p.catch((e) => console.warn('Recordatorio de fotos:', e));
+  await App.addListener('appStateChange', ({ isActive }) => {
+    safe(isActive ? controller.onForeground() : controller.onBackground());
+  });
+  safe(controller.onForeground());
+  setInterval(() => {
+    if (document.visibilityState === 'visible') safe(controller.tick());
+  }, 60_000);
+}
+"""
+
 OFFLINE_WRITES_TS = r"""import {
   setDoc as _setDoc,
   updateDoc as _updateDoc,
@@ -393,16 +680,38 @@ const config: CapacitorConfig = {
   plugins: {
     // La web NO se dibuja debajo de la barra de estado ni de la barra de navegacion
     SystemBars: { insetsHandling: 'css', initialViewportFitValueHint: 'contain' },
+    LocalNotifications: { smallIcon: 'ic_stat_checkinventory', iconColor: '#F59E0B' },
   },
 };
 
 export default config;
 """
 
-for path, content in [('src/native.ts', NATIVE_TS), ('src/zipStream.ts', ZIPSTREAM_TS),
+for path, content in [('src/native.ts', NATIVE_TS), ('src/zipStream.ts', ZIPSTREAM_TS), ('src/reminders.ts', REMINDERS_TS),
                       ('src/offlineWrites.ts', OFFLINE_WRITES_TS)]:
     write(path, content)
     print(f'+ {path}: escrito')
+
+
+def ensure_notification_plugins():
+    """El workflow solo instala los plugins basicos; los de recordatorios los instala este script."""
+    wanted = [('@capacitor/app', '8.1.2'), ('@capacitor/local-notifications', '8.3.1')]
+    missing = [f'{pkg}@{ver}' for pkg, ver in wanted if not pathlib.Path('node_modules', *pkg.split('/')).exists()]
+    if not missing:
+        print('= plugins de notificaciones: ya instalados')
+        return
+    print('+ instalando', ' '.join(missing))
+    try:
+        r = subprocess.run(['npm', 'install', '--legacy-peer-deps', '--no-audit', '--no-fund', *missing])
+    except FileNotFoundError:
+        errors.append('npm no esta disponible para instalar ' + ' '.join(missing))
+        return
+    if r.returncode != 0:
+        errors.append('no se pudieron instalar los plugins de notificaciones: ' + ' '.join(missing))
+
+
+ensure_notification_plugins()
+
 # capacitor.config.ts: se reescribe siempre, pero conservando el appId y el nombre que ya hubiera
 app_id, app_name = 'com.checkinventory.app', 'CheckInventory'
 if ROOT.joinpath('capacitor.config.ts').exists():
