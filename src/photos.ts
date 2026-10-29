@@ -99,9 +99,11 @@ export function getPhotosOf(
 
   // Primer paso: Fotos antiguas
   for (const legacy of rawLegacyPhotos) {
-    if (!legacy || !legacy.id) continue;
-    photoMap.set(legacy.id, {
+    if (!legacy) continue;
+    const key = legacy.id || legacy.localBlobId || legacy.url || `legacy_${Math.random()}`;
+    photoMap.set(key, {
       ...legacy,
+      id: key,
       syncStatus: legacy.syncStatus || 'synced'
     });
   }

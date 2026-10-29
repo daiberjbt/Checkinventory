@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { 
   Plus, 
   Home, 
@@ -621,6 +621,67 @@ export default function App() {
   const annexCameraInputRef = useRef<HTMLInputElement>(null);
   const annexGalleryInputRef = useRef<HTMLInputElement>(null);
 
+  const continuousCameraOpenRef = useRef(false);
+  const cameraHistoryPushedRef = useRef(false);
+
+  useEffect(() => {
+    continuousCameraOpenRef.current = continuousCamera.open;
+  }, [continuousCamera.open]);
+
+  // Reanudar subida si la app pasa a segundo plano o desmonta
+  useEffect(() => {
+    const handleVis = () => {
+      if (document.visibilityState === 'hidden') {
+        photoSyncEngine.resume();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVis);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVis);
+      photoSyncEngine.resume();
+    };
+  }, []);
+
+  const openContinuousCamera = useCallback((
+    targetType: 'space' | 'annex', 
+    spaceId?: string, 
+    spaceTitle?: string
+  ) => {
+    setContinuousCamera({
+      open: true,
+      target: targetType,
+      spaceId,
+      spaceTitle
+    });
+    // Historial con view actual y flag de cámara continua
+    window.history.pushState({ view, continuousCamera: true }, '');
+    cameraHistoryPushedRef.current = true;
+    // Pausar subida de fotos mientras la cámara esté abierta para dedicar 100% recursos a captura
+    photoSyncEngine.pause();
+  }, [view]);
+
+  const closeContinuousCamera = useCallback((fromPopState: boolean = false) => {
+    // 1. Reanudar subida de fotos
+    photoSyncEngine.resume();
+
+    // 2. Consumir entrada de historial si no provino ya de popstate
+    if (!fromPopState && cameraHistoryPushedRef.current) {
+      cameraHistoryPushedRef.current = false;
+      if (window.history.state?.continuousCamera) {
+        try {
+          window.history.back();
+        } catch (e) {
+          console.warn('Error consumiendo historial de cámara continua:', e);
+        }
+      }
+    } else {
+      cameraHistoryPushedRef.current = false;
+    }
+
+    // 3. Cerrar cámara
+    setContinuousCamera(prev => ({ ...prev, open: false }));
+  }, []);
+
   useEffect(() => {
     const handleOnline = () => {
       setIsOnline(true);
@@ -716,6 +777,12 @@ export default function App() {
 
   useEffect(() => {
     const handlePopState = (event: PopStateEvent) => {
+      if (continuousCameraOpenRef.current) {
+        // La cámara continua estaba abierta cuando el usuario pulsó Atrás en Android
+        cameraHistoryPushedRef.current = false;
+        closeContinuousCamera(true);
+        return;
+      }
       if (event.state && event.state.view) {
         setView(event.state.view);
       } else {
@@ -3474,10 +3541,12 @@ export default function App() {
     userId: string, 
     inventoryId: string,
     spaceId?: string,
-    isAnnex = false
-  ): Promise<{ photo: Photo; usedStorage: boolean; storageRef?: any }> => {
+    isAnnex = false,
+    capturedAt?: number
+  ): Promise<{ photo: Photo; record: OfflinePhotoRecord; usedStorage: boolean; storageRef?: any }> => {
     const { blob } = await processImageToBlob(file);
     const photoId = uuidv4();
+    const effectiveTimestamp = capturedAt || Date.now();
 
     // Secure Tenant Identification strictly from session/claims
     const tenantAdminUid = currentUser?.role === 'admin'
@@ -3502,8 +3571,8 @@ export default function App() {
       uploadedBy: userId,
       status: 'pending',
       retryCount: 0,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
+      createdAt: effectiveTimestamp,
+      updatedAt: effectiveTimestamp,
       storageUploaded: false,
       sizeBytes: blob.size,
       mimeType: 'image/jpeg'
@@ -3523,25 +3592,28 @@ export default function App() {
       localBlobId: photoId,
       syncStatus: 'pending',
       storagePath,
-      timestamp: Date.now()
+      timestamp: effectiveTimestamp
     };
 
     // Note: Background sync will be triggered in an orderly fashion after saveInventory() confirms Firestore
     return {
       photo: lightPhoto,
+      record: photoRecord,
       usedStorage: false
     };
   };
 
   const addPhotosToTarget = async (
     files: File[],
-    target: { type: 'space' | 'annex'; spaceId?: string }
+    target: { type: 'space' | 'annex'; spaceId?: string; capturedAt?: number }
   ): Promise<Photo[]> => {
     if (!isSubscriptionActive()) {
       showNotify('Tu licencia temporal ha vencido. Activa un código de 6 meses para añadir fotos.', 'error');
       return [];
     }
-    if (!currentInventory || currentInventory.status !== 'draft') {
+
+    const currentInv = currentInventoryRef.current;
+    if (!currentInv || currentInv.status !== 'draft') {
       showNotify('No se pueden añadir fotos a un documento firmado o archivado.', 'error');
       return [];
     }
@@ -3552,18 +3624,24 @@ export default function App() {
     if (!isAnnex && !effectiveSpaceId) return [];
 
     const newPhotos: Photo[] = [];
+    const newRecords: OfflinePhotoRecord[] = [];
     const failedFiles: string[] = [];
 
     for (const file of files) {
       try {
+        const invId = currentInventoryRef.current?.id || currentInv.id;
         const result = await uploadPhotoWithFallback(
           file, 
           currentUser.id, 
-          currentInventory.id, 
+          invId, 
           effectiveSpaceId, 
-          isAnnex
+          isAnnex,
+          target.capturedAt
         );
         newPhotos.push(result.photo);
+        if (result.record) {
+          newRecords.push(result.record);
+        }
       } catch (err: any) {
         console.error(`Error processing photo ${file.name}:`, err);
         failedFiles.push(file.name);
@@ -3577,21 +3655,56 @@ export default function App() {
       return [];
     }
 
+    // 1. Actualizar estado del inventario de forma funcional pura (prev => ...)
     if (isAnnex) {
-      setAnnexPhotos(prev => [...prev, ...newPhotos]);
+      setAnnexPhotos(prev => {
+        const existingIds = new Set(prev.map(p => p.id));
+        const toAdd = newPhotos.filter(p => !existingIds.has(p.id));
+        return [...prev, ...toAdd];
+      });
     } else {
-      const updatedSpaces = (currentInventory.spaces || []).map(s => {
-        if (s.id === effectiveSpaceId) {
-          const existingPhotos = Array.isArray(s.photos) ? s.photos : [];
-          return { ...s, photos: [...existingPhotos, ...newPhotos] };
-        }
-        return s;
+      setCurrentInventory(prev => {
+        if (!prev) return null;
+        const updatedSpaces = (prev.spaces || []).map(s => {
+          if (s.id === effectiveSpaceId) {
+            const existingPhotos = Array.isArray(s.photos) ? s.photos : [];
+            const existingIds = new Set(existingPhotos.map(p => p.id));
+            const toAdd = newPhotos.filter(p => !existingIds.has(p.id));
+            return { ...s, photos: [...existingPhotos, ...toAdd] };
+          }
+          return s;
+        });
+        return { ...prev, spaces: updatedSpaces };
       });
 
-      setCurrentInventory(prev => prev ? { ...prev, spaces: updatedSpaces } : null);
-      setInventories(prev => prev.map(inv => 
-        inv.id === currentInventory.id ? { ...inv, spaces: updatedSpaces } : inv
-      ));
+      setInventories(prevInvs => {
+        const targetInvId = currentInventoryRef.current?.id || currentInv.id;
+        return prevInvs.map(inv => {
+          if (inv.id !== targetInvId) return inv;
+          const updatedSpaces = (inv.spaces || []).map(s => {
+            if (s.id === effectiveSpaceId) {
+              const existingPhotos = Array.isArray(s.photos) ? s.photos : [];
+              const existingIds = new Set(existingPhotos.map(p => p.id));
+              const toAdd = newPhotos.filter(p => !existingIds.has(p.id));
+              return { ...s, photos: [...existingPhotos, ...toAdd] };
+            }
+            return s;
+          });
+          return { ...inv, spaces: updatedSpaces };
+        });
+      });
+    }
+
+    // 2. Reflejar inmediatamente en memoria las fotos pendientes para que getPhotosOf las muestre al instante
+    if (newRecords.length > 0) {
+      setPendingLocalPhotos(prev => {
+        const newIds = new Set(newRecords.map(r => r.id));
+        return [...prev.filter(r => !newIds.has(r.id)), ...newRecords];
+      });
+      setGlobalPendingPhotos(prev => {
+        const newIds = new Set(newRecords.map(r => r.id));
+        return [...prev.filter(r => !newIds.has(r.id)), ...newRecords];
+      });
     }
 
     if (failedFiles.length > 0) {
@@ -3627,37 +3740,47 @@ export default function App() {
   };
 
   const removePhoto = async (spaceId: string, photoId: string) => {
-    if (!currentInventory) return;
-    if (currentInventory.status !== 'draft') {
+    const activeInv = currentInventoryRef.current;
+    if (!activeInv) return;
+    if (activeInv.status !== 'draft') {
       showNotify('No se pueden eliminar fotos de un inventario firmado.', 'error');
       return;
     }
     
     // Find the photo to delete from storage
-    const targetSpace = currentInventory.spaces.find(s => s.id === spaceId);
+    const targetSpace = activeInv.spaces.find(s => s.id === spaceId);
     const photoToDelete = targetSpace?.photos.find(p => p.id === photoId);
 
-    const updatedSpaces = currentInventory.spaces.map(s => {
-      if (s.id === spaceId) {
-        return { ...s, photos: s.photos.filter(p => p.id !== photoId) };
-      }
-      return s;
+    // Actualizar estado local inmediatamente de forma funcional
+    setCurrentInventory(prev => {
+      if (!prev) return null;
+      const updatedSpaces = (prev.spaces || []).map(s => {
+        if (s.id === spaceId) {
+          return { ...s, photos: (s.photos || []).filter(p => p.id !== photoId) };
+        }
+        return s;
+      });
+      return { ...prev, spaces: updatedSpaces };
     });
 
-    const sanitizedDoc = sanitizeInventory({ ...currentInventory, spaces: updatedSpaces });
-    const sanitizedSpaces = sanitizedDoc.spaces;
+    setInventories(prev => prev.map(inv => {
+      if (inv.id !== activeInv.id) return inv;
+      const updatedSpaces = (inv.spaces || []).map(s => {
+        if (s.id === spaceId) {
+          return { ...s, photos: (s.photos || []).filter(p => p.id !== photoId) };
+        }
+        return s;
+      });
+      return { ...inv, spaces: updatedSpaces };
+    }));
 
-    // Actualizar estado local inmediatamente
-    setCurrentInventory(prev => prev ? { ...prev, spaces: updatedSpaces } : null);
-    setInventories(prev => prev.map(inv => 
-      inv.id === currentInventory.id ? { ...inv, spaces: updatedSpaces } : inv
-    ));
     setSubcollectionPhotos(prev => prev.filter(p => p.id !== photoId));
     setPendingLocalPhotos(prev => prev.filter(p => p.id !== photoId));
+    setGlobalPendingPhotos(prev => prev.filter(p => p.id !== photoId));
 
     // 1. Borrar de la subcolección de Firestore si existe allí
     try {
-      await deleteDoc(doc(db, 'inventories', currentInventory.id, 'photos', photoId));
+      await deleteDoc(doc(db, 'inventories', activeInv.id, 'photos', photoId));
     } catch (subErr) {
       // No existía en la subcolección (estaba solo en local)
     }
@@ -3670,39 +3793,24 @@ export default function App() {
       console.warn('Error deleting pending photo from IndexedDB:', e);
     }
 
-    // 3. Persistir en Firestore si era una foto antigua embebida en spaces
-    try {
-      const inventoryRef = doc(db, 'inventories', currentInventory.id);
-      const isExistingInState = inventories.some(i => i.id === currentInventory.id);
-      if (isExistingInState) {
-        await updateDoc(inventoryRef, {
-          spaces: sanitizedSpaces,
-          updatedAt: Date.now()
-        });
-      }
-
-      // 4. Si la foto estaba en Storage, eliminar archivo y miniatura
-      const targetUrl = photoToDelete?.url || photoToDelete?.dataUrl;
-      if (targetUrl && targetUrl.startsWith('http')) {
-        try {
-          const decodedUrl = decodeURIComponent(targetUrl);
-          const pathPart = decodedUrl.split('/o/')[1].split('?')[0];
-          const photoRef = ref(storage, pathPart);
-          await deleteObject(photoRef);
-          if (pathPart.endsWith('.jpg')) {
-            const thumbRef = ref(storage, pathPart.replace(/\.jpg$/, '_thumb.jpg'));
-            await deleteObject(thumbRef).catch(() => {});
-          }
-        } catch (e) {
-          console.warn('Could not delete photo file from storage:', e);
+    // 3. Si la foto estaba en Storage, eliminar archivo y miniatura
+    const targetUrl = photoToDelete?.url || photoToDelete?.dataUrl;
+    if (targetUrl && targetUrl.startsWith('http')) {
+      try {
+        const decodedUrl = decodeURIComponent(targetUrl);
+        const pathPart = decodedUrl.split('/o/')[1].split('?')[0];
+        const photoRef = ref(storage, pathPart);
+        await deleteObject(photoRef);
+        if (pathPart.endsWith('.jpg')) {
+          const thumbRef = ref(storage, pathPart.replace(/\.jpg$/, '_thumb.jpg'));
+          await deleteObject(thumbRef).catch(() => {});
         }
+      } catch (e) {
+        console.warn('Could not delete photo file from storage:', e);
       }
-
-      showNotify('Fotografía eliminada');
-    } catch (error) {
-      console.error('Error removing photo from Firestore:', error);
-      showNotify('Error al eliminar la foto del servidor', 'error');
     }
+
+    showNotify('Fotografía eliminada');
   };
 
   const toggleSpace = (id: string) => {
@@ -3829,6 +3937,41 @@ export default function App() {
       }
     }
   };
+
+  const handleCameraCapture = useCallback(async (file: File, capturedAt: number) => {
+    const res = await addPhotosToTarget([file], {
+      type: continuousCamera.target,
+      spaceId: continuousCamera.spaceId,
+      capturedAt
+    });
+    return res[0] || null;
+  }, [continuousCamera.target, continuousCamera.spaceId]);
+
+  const handleCameraUndo = useCallback(async (photoId: string) => {
+    if (continuousCamera.target === 'annex') {
+      await removeAnnexPhoto(photoId);
+    } else if (continuousCamera.spaceId) {
+      await removePhoto(continuousCamera.spaceId, photoId);
+    }
+  }, [continuousCamera.target, continuousCamera.spaceId]);
+
+  const handleCameraOpenGallery = useCallback(() => {
+    if (continuousCamera.target === 'annex') {
+      annexGalleryInputRef.current?.click();
+    } else {
+      if (continuousCamera.spaceId) setTargetSpaceId(continuousCamera.spaceId);
+      galleryInputRef.current?.click();
+    }
+  }, [continuousCamera.target, continuousCamera.spaceId]);
+
+  const handleCameraOpenSystemCamera = useCallback(() => {
+    if (continuousCamera.target === 'annex') {
+      annexCameraInputRef.current?.click();
+    } else {
+      if (continuousCamera.spaceId) setTargetSpaceId(continuousCamera.spaceId);
+      cameraInputRef.current?.click();
+    }
+  }, [continuousCamera.target, continuousCamera.spaceId]);
 
   const handleSaveReception = async () => {
     if (!currentInventory || !receptionType || !receptionSignature) return;
@@ -5606,7 +5749,7 @@ export default function App() {
                       </div>
                     ))}
                     <button 
-                      onClick={() => setContinuousCamera({ open: true, target: 'annex', spaceTitle: 'Fotografías del Anexo' })}
+                      onClick={() => openContinuousCamera('annex', undefined, 'Fotografías del Anexo')}
                       className="aspect-square border-2 border-dashed border-black/5 rounded-xl flex flex-col items-center justify-center text-muted hover:bg-black/[0.02] transition-all"
                     >
                       <Plus size={20} />
@@ -9227,12 +9370,7 @@ export default function App() {
                                 <button 
                                   onClick={() => {
                                     setTargetSpaceId(space.id);
-                                    setContinuousCamera({
-                                      open: true,
-                                      target: 'space',
-                                      spaceId: space.id,
-                                      spaceTitle: space.title || 'Espacio'
-                                    });
+                                    openContinuousCamera('space', space.id, space.title || 'Espacio');
                                   }}
                                   className="text-xs font-bold flex items-center gap-2 text-black hover:opacity-70 transition-all bg-black/5 px-3 py-1.5 rounded-xl"
                                 >
@@ -9253,12 +9391,7 @@ export default function App() {
                                     <div 
                                       onClick={() => {
                                         setTargetSpaceId(space.id);
-                                        setContinuousCamera({
-                                          open: true,
-                                          target: 'space',
-                                          spaceId: space.id,
-                                          spaceTitle: space.title || 'Espacio'
-                                        });
+                                        openContinuousCamera('space', space.id, space.title || 'Espacio');
                                       }}
                                       className="border-2 border-dashed border-black/5 rounded-2xl p-10 text-center cursor-pointer hover:bg-black/[0.02] transition-all"
                                     >
@@ -9311,12 +9444,7 @@ export default function App() {
                                       <button 
                                         onClick={() => {
                                           setTargetSpaceId(space.id);
-                                          setContinuousCamera({
-                                            open: true,
-                                            target: 'space',
-                                            spaceId: space.id,
-                                            spaceTitle: space.title || 'Espacio'
-                                          });
+                                          openContinuousCamera('space', space.id, space.title || 'Espacio');
                                         }}
                                         className="aspect-square border-2 border-dashed border-black/5 rounded-xl flex flex-col items-center justify-center text-muted hover:bg-black/[0.02] transition-all"
                                       >
@@ -9817,50 +9945,12 @@ export default function App() {
       {/* In-App Continuous Shutter Camera */}
       <ContinuousCamera
         isOpen={continuousCamera.open}
-        targetTitle={continuousCamera.spaceTitle || (continuousCamera.target === 'annex' ? 'Anexo' : 'Espacio')}
-        onClose={() => setContinuousCamera(prev => ({ ...prev, open: false }))}
-        onCapturePhoto={async (file) => {
-          const res = await addPhotosToTarget([file], {
-            type: continuousCamera.target,
-            spaceId: continuousCamera.spaceId
-          });
-          return res[0] || null;
-        }}
-        onUndoPhoto={async (photoId) => {
-          if (continuousCamera.target === 'annex') {
-            await removeAnnexPhoto(photoId);
-          } else if (continuousCamera.spaceId) {
-            await removePhoto(continuousCamera.spaceId, photoId);
-          }
-        }}
-        onOpenGallery={() => {
-          if (continuousCamera.target === 'annex') {
-            annexGalleryInputRef.current?.click();
-          } else {
-            if (continuousCamera.spaceId) setTargetSpaceId(continuousCamera.spaceId);
-            galleryInputRef.current?.click();
-          }
-        }}
-        onOpenSystemCamera={() => {
-          if (continuousCamera.target === 'annex') {
-            annexCameraInputRef.current?.click();
-          } else {
-            if (continuousCamera.spaceId) setTargetSpaceId(continuousCamera.spaceId);
-            cameraInputRef.current?.click();
-          }
-        }}
-        onErrorFallback={(msg) => {
-          setContinuousCamera(prev => ({ ...prev, open: false }));
-          showNotify(msg, 'warning', 4000);
-          setTimeout(() => {
-            if (continuousCamera.target === 'annex') {
-              annexCameraInputRef.current?.click();
-            } else {
-              if (continuousCamera.spaceId) setTargetSpaceId(continuousCamera.spaceId);
-              cameraInputRef.current?.click();
-            }
-          }, 150);
-        }}
+        target={continuousCamera}
+        onClose={() => closeContinuousCamera(false)}
+        onCapturePhoto={handleCameraCapture}
+        onUndoPhoto={handleCameraUndo}
+        onOpenGallery={handleCameraOpenGallery}
+        onOpenSystemCamera={handleCameraOpenSystemCamera}
       />
     </div>
   );

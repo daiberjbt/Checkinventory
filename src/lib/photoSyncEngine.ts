@@ -45,6 +45,8 @@ export class PhotoSyncEngine {
   private abortController: AbortController | null = null;
   private broadcastChannel: BroadcastChannel | null = null;
   private persistedInventoryIds: Set<string> = new Set();
+  private isPaused = false;
+  private pauseTimeoutId: any = null;
 
   private constructor() {
     if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
@@ -97,6 +99,37 @@ export class PhotoSyncEngine {
 
   public isInventoryPersisted(inventoryId: string): boolean {
     return this.persistedInventoryIds.has(inventoryId);
+  }
+
+  public pause(): void {
+    this.isPaused = true;
+    console.log('[SyncEngine] Subida de fotos pausada (cámara continua activa)');
+    if (this.pauseTimeoutId) clearTimeout(this.pauseTimeoutId);
+    // Seguro de 15 minutos: reanudación automática obligatoria
+    this.pauseTimeoutId = setTimeout(() => {
+      if (this.isPaused) {
+        console.warn('[SyncEngine] Seguro de 15 minutos activado: reanudando subida de fotos');
+        this.resume();
+      }
+    }, 15 * 60 * 1000);
+  }
+
+  public resume(): void {
+    if (this.pauseTimeoutId) {
+      clearTimeout(this.pauseTimeoutId);
+      this.pauseTimeoutId = null;
+    }
+    if (this.isPaused) {
+      this.isPaused = false;
+      console.log('[SyncEngine] Subida de fotos reanudada');
+      if (navigator.onLine && this.currentAdminUid) {
+        this.processQueue();
+      }
+    }
+  }
+
+  public getIsPaused(): boolean {
+    return this.isPaused;
   }
 
   public subscribe(listener: SyncListener): () => void {
@@ -206,6 +239,7 @@ export class PhotoSyncEngine {
    * promesas compartidas, Web Locks y concurrencia de hasta 3 fotos en paralelo.
    */
   public async processQueue(): Promise<void> {
+    if (this.isPaused) return;
     if (this.isRunning) return;
     if (this.activeSyncPromise) return this.activeSyncPromise;
     if (!this.currentAdminUid) return;

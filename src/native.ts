@@ -5,6 +5,7 @@ import { SpeechRecognition } from '@capacitor-community/speech-recognition';
 import type JSZip from 'jszip';
 import firebaseConfig from '../firebase-applet-config.json';
 import { streamZipBase64 } from './zipStream';
+import { startPhotoReminders } from './reminders';
 
 export const isNative = Capacitor.isNativePlatform();
 
@@ -138,6 +139,13 @@ if (isNative) {
         wake();
       }
     });
+  }
+
+  // 1c) Recordatorio local cuando quedan fotos sin subir (no necesita internet ni servidor)
+  try {
+    void startPhotoReminders();
+  } catch (e) {
+    console.warn('Recordatorios no disponibles', e);
   }
 
   // 2) navigator.share / canShare no existen en el WebView: se reemplazan por el menu nativo de Android
