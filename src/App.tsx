@@ -102,7 +102,8 @@ import {
   getPendingPhotosByAdminUid,
   getPendingPhotosByInventory,
   getPendingPhoto,
-  updatePhotoRecord 
+  updatePhotoRecord,
+  deletePhotosByInventory
 } from './lib/offlinePhotoDb';
 import { auth, db, storage } from './firebase';
 import { onAuthStateChanged, signOut, sendEmailVerification } from 'firebase/auth';
@@ -141,7 +142,8 @@ import {
   onStorageCircuitBreakerChange 
 } from './lib/quotaCircuitBreaker';
 import { SyncStatusChip } from './components/SyncStatusChip';
-import { SyncStatusSheet } from './components/SyncStatusSheet';
+import { SyncStatusSheet, OrphanPhotoGroup } from './components/SyncStatusSheet';
+import { ExitDraftDialog } from './components/ExitDraftDialog';
 import { CriticalBlockingBanner } from './components/CriticalBlockingBanner';
 import { ContinuousCamera } from './components/ContinuousCamera';
 import { buildSearchTokens, computeIsReceived, computeIsAssigned, normalizeText } from './lib/searchTokens';
@@ -426,10 +428,37 @@ export default function App() {
     currentInventoryRef.current = currentInventory;
   }, [currentInventory]);
 
+  const viewRef = useRef<ViewType>(view);
+  useEffect(() => {
+    viewRef.current = view;
+  }, [view]);
+
+  const inventoriesRef = useRef<Inventory[]>(inventories);
+  useEffect(() => {
+    inventoriesRef.current = inventories;
+  }, [inventories]);
+
   // Estados de fotografías para subcolecciones de Firestore e IndexedDB
   const [subcollectionPhotos, setSubcollectionPhotos] = useState<InventoryPhotoDoc[]>([]);
   const [pendingLocalPhotos, setPendingLocalPhotos] = useState<OfflinePhotoRecord[]>([]);
+  const pendingLocalPhotosRef = useRef<OfflinePhotoRecord[]>(pendingLocalPhotos);
+  useEffect(() => {
+    pendingLocalPhotosRef.current = pendingLocalPhotos;
+  }, [pendingLocalPhotos]);
+
   const [globalPendingPhotos, setGlobalPendingPhotos] = useState<OfflinePhotoRecord[]>([]);
+
+  // Diálogo para prevenir fotos huérfanas al salir de borrador nuevo
+  const [showExitDraftDialog, setShowExitDraftDialog] = useState(false);
+  const [exitDraftPhotoCount, setExitDraftPhotoCount] = useState(0);
+  const [highlightRequiredFields, setHighlightRequiredFields] = useState(false);
+  const pendingExitDestinationRef = useRef<'home' | 'back' | 'popstate'>('back');
+  const requestExitRef = useRef<(destino: 'home' | 'back' | 'popstate') => Promise<void>>(async () => {});
+
+  // Detección y gestión de fotos huérfanas existentes en SyncStatusSheet
+  const [orphanPhotoGroups, setOrphanPhotoGroups] = useState<OrphanPhotoGroup[]>([]);
+  const verifiedNonExistentInvsRef = useRef<Set<string>>(new Set());
+  const verifiedExistentInvsRef = useRef<Set<string>>(new Set());
   const [isRetryingSync, setIsRetryingSync] = useState(false);
   const [authQuotaErrorMessage, setAuthQuotaErrorMessage] = useState<string | null>(null);
   const [isLimitedMode, setIsLimitedMode] = useState<boolean>(false);
@@ -783,6 +812,10 @@ export default function App() {
         closeContinuousCamera(true);
         return;
       }
+      if (viewRef.current === 'create') {
+        requestExitRef.current('popstate');
+        return;
+      }
       if (event.state && event.state.view) {
         setView(event.state.view);
       } else {
@@ -799,6 +832,88 @@ export default function App() {
 
     return () => window.removeEventListener('popstate', handlePopState);
   }, []);
+
+  // Detección periódica y bajo demanda de fotos huérfanas en segundo plano (Requirement 7)
+  useEffect(() => {
+    if (!isSyncStatusSheetOpen || globalPendingPhotos.length === 0) {
+      setOrphanPhotoGroups([]);
+      return;
+    }
+
+    let isMounted = true;
+    const checkOrphans = async () => {
+      const map = new Map<string, { count: number; oldestTimestamp: number }>();
+      const activeOpenId = currentInventoryRef.current?.id;
+      const currentInvs = inventoriesRef.current || [];
+
+      for (const rec of globalPendingPhotos) {
+        if (!rec.inventoryId) continue;
+        if (rec.inventoryId === activeOpenId) continue; // omitir borrador abierto actualmente en pantalla
+        // Verificar si existe en lista de inventarios locales (incluye escrituras locales pendientes)
+        if (currentInvs.some(inv => inv.id === rec.inventoryId)) continue;
+        if (verifiedExistentInvsRef.current.has(rec.inventoryId)) continue;
+
+        const currentGroup = map.get(rec.inventoryId) || { count: 0, oldestTimestamp: rec.timestamp || Date.now() };
+        currentGroup.count += 1;
+        currentGroup.oldestTimestamp = Math.min(currentGroup.oldestTimestamp, rec.timestamp || Date.now());
+        map.set(rec.inventoryId, currentGroup);
+      }
+
+      if (map.size === 0) {
+        if (isMounted) setOrphanPhotoGroups([]);
+        return;
+      }
+
+      const orphanResults: OrphanPhotoGroup[] = [];
+
+      for (const [invId, groupData] of map.entries()) {
+        if (verifiedNonExistentInvsRef.current.has(invId)) {
+          orphanResults.push({ inventoryId: invId, count: groupData.count, oldestTimestamp: groupData.oldestTimestamp });
+          continue;
+        }
+
+        // Si hay conexión y no hay bloqueo de cuota, verificar existencia en Firestore
+        if (navigator.onLine && !isFirestoreCircuitBreakerActive()) {
+          try {
+            const snap = await getDoc(doc(db, 'inventories', invId));
+            if (snap.exists()) {
+              verifiedExistentInvsRef.current.add(invId);
+              continue;
+            } else {
+              verifiedNonExistentInvsRef.current.add(invId);
+              orphanResults.push({ inventoryId: invId, count: groupData.count, oldestTimestamp: groupData.oldestTimestamp });
+            }
+          } catch (e) {
+            console.warn('Error verificando existencia de inventario para fotos huérfanas:', e);
+            orphanResults.push({ inventoryId: invId, count: groupData.count, oldestTimestamp: groupData.oldestTimestamp });
+          }
+        } else {
+          // Sin conexión: no está en inventarios locales, se reporta como grupo huérfano
+          orphanResults.push({ inventoryId: invId, count: groupData.count, oldestTimestamp: groupData.oldestTimestamp });
+        }
+      }
+
+      if (isMounted) {
+        setOrphanPhotoGroups(orphanResults);
+      }
+    };
+
+    checkOrphans();
+    return () => { isMounted = false; };
+  }, [isSyncStatusSheetOpen, globalPendingPhotos, inventories]);
+
+  const handleDiscardOrphanGroup = async (invId: string) => {
+    try {
+      await deletePhotosByInventory(invId);
+      setGlobalPendingPhotos(prev => prev.filter(p => p.inventoryId !== invId));
+      setPendingLocalPhotos(prev => prev.filter(p => p.inventoryId !== invId));
+      setOrphanPhotoGroups(prev => prev.filter(g => g.inventoryId !== invId));
+      showNotify('Fotografías huérfanas descartadas con éxito', 'success');
+    } catch (e) {
+      console.error('Error descartando fotografías huérfanas:', e);
+      showNotify('Error al descartar fotografías huérfanas', 'error');
+    }
+  };
 
   const navigateTo = (newView: ViewType) => {
     if (view === newView) return;
@@ -2543,56 +2658,171 @@ export default function App() {
     }
   };
 
-  const handleGoHome = async () => {
-    if (view === 'list') return;
-    
-    if (view === 'create' && currentInventory && currentInventory.status === 'draft') {
-      const isBasicallyEmpty = !currentInventory.propertyName.trim() && 
-                              !currentInventory.address.trim() && 
-                              !currentInventory.ownerName?.trim() && 
-                              !currentInventory.tenantName?.trim() &&
-                              !currentInventory.internalCode?.trim();
-      
-      if (!isBasicallyEmpty && currentInventory.propertyName.trim() && currentInventory.address.trim()) {
-        const saved = await saveInventory(currentInventory);
-        if (!saved) {
-          showNotify('No se pudo guardar el borrador. Revisa tu conexión.', 'error');
-          return; // Stay on the page if save fails
-        }
+  // Inspecciona si un borrador tiene datos o fotografías cargadas (Requirement 2)
+  const inspectDraftWork = (inv: Inventory) => {
+    const pendingCount = (pendingLocalPhotosRef.current || []).filter(p => p.inventoryId === inv.id).length;
+    const memorySpacePhotos = (inv.spaces || []).reduce((acc, s) => acc + (s.photos?.length || 0), 0);
+    const memoryAnnexPhotos = (inv.annexes || []).reduce((acc, a) => acc + (a.photos?.length || 0), 0);
+    const totalPhotos = Math.max(pendingCount, memorySpacePhotos + memoryAnnexPhotos);
+
+    const hasName = Boolean(inv.propertyName && inv.propertyName.trim());
+    const hasAddress = Boolean(inv.address && inv.address.trim());
+    const hasOwner = Boolean(inv.ownerName && inv.ownerName.trim());
+    const hasTenant = Boolean(inv.tenantName && inv.tenantName.trim());
+    const hasCode = Boolean(inv.internalCode && inv.internalCode.trim());
+    const hasNeighborhood = Boolean(inv.neighborhood && inv.neighborhood.trim());
+    const hasRent = Boolean(inv.rentValue && inv.rentValue.trim());
+
+    // Verificar si hay observaciones en espacios o detalles en ítems
+    const hasSpaceContent = (inv.spaces || []).some(s => 
+      Boolean(s.generalObservations && s.generalObservations.trim()) ||
+      (s.items || []).some(item => Boolean(item.details && item.details.trim()))
+    );
+
+    const hasWork = totalPhotos > 0 || hasName || hasAddress || hasOwner || hasTenant || hasCode || hasNeighborhood || hasRent || hasSpaceContent;
+    const isMissingRequired = !hasName || !hasAddress;
+
+    return { hasWork, totalPhotos, isMissingRequired };
+  };
+
+  const executeExitNavigation = (destino: 'home' | 'back' | 'popstate') => {
+    if (destino === 'home') {
+      navigateTo('list');
+    } else if (destino === 'back') {
+      if (window.history.state && window.history.state.view !== 'list') {
+        window.history.back();
+      } else {
+        setView('list');
       }
+    } else if (destino === 'popstate') {
+      setView('list');
+    }
+  };
+
+  // Función unificada para salidas de la app / navegación (Requirement 1, 2, 3, 4, 5)
+  const requestExit = async (destino: 'home' | 'back' | 'popstate') => {
+    if (viewRef.current !== 'create' || !currentInventoryRef.current) {
+      executeExitNavigation(destino);
+      return;
     }
 
+    const inv = currentInventoryRef.current;
+    const isAlreadySaved = (inventoriesRef.current || []).some(i => i.id === inv.id);
+
+    // Si ya existe en la lista guardada de inventarios, comportamiento habitual de actualización
+    if (isAlreadySaved) {
+      if (inv.status === 'draft' && inv.propertyName.trim() && inv.address.trim()) {
+        const saved = await saveInventory(inv);
+        if (!saved) {
+          showNotify('No se pudo guardar el borrador. Revisa tu conexión.', 'error');
+          return;
+        }
+      }
+      setCurrentInventory(null);
+      setSignatures({ owner: '', tenant: '' });
+      executeExitNavigation(destino);
+      return;
+    }
+
+    // Inventario nuevo no guardado
+    const { hasWork, totalPhotos, isMissingRequired } = inspectDraftWork(inv);
+
+    // 3) Si NO tiene trabajo: salir en silencio y eliminar fotos latentes si las hubiera
+    if (!hasWork) {
+      try {
+        await deletePhotosByInventory(inv.id);
+      } catch (e) {
+        console.warn('Error eliminando fotos residuales en salida silenciosa:', e);
+      }
+      setCurrentInventory(null);
+      setSignatures({ owner: '', tenant: '' });
+      executeExitNavigation(destino);
+      return;
+    }
+
+    // 4) Si tiene trabajo y tiene nombre y dirección completos: autoguardar borrador y salir
+    if (!isMissingRequired) {
+      const saved = await saveInventory(inv);
+      if (!saved) {
+        showNotify('No se pudo guardar el borrador. Revisa tu conexión.', 'error');
+        return;
+      }
+      setCurrentInventory(null);
+      setSignatures({ owner: '', tenant: '' });
+      executeExitNavigation(destino);
+      return;
+    }
+
+    // 5) Si tiene trabajo pero falta nombre o dirección: mostrar diálogo ExitDraftDialog
+    if (destino === 'popstate') {
+      // 6) Restaurar la entrada de historial para no salir mientras se decide
+      window.history.pushState({ view: 'create' }, '');
+    }
+    pendingExitDestinationRef.current = destino;
+    setExitDraftPhotoCount(totalPhotos);
+    setShowExitDraftDialog(true);
+  };
+
+  // Mantener ref siempre sincronizada para el listener popstate
+  requestExitRef.current = requestExit;
+
+  const handleContinueEditing = () => {
+    setShowExitDraftDialog(false);
+  };
+
+  const handleSaveDraftFromExitDialog = async () => {
+    if (!currentInventoryRef.current) return;
+    const inv = currentInventoryRef.current;
+    if (!inv.propertyName.trim() || !inv.address.trim()) {
+      setHighlightRequiredFields(true);
+      showNotify('Completa nombre y dirección para guardar', 'error');
+      setShowExitDraftDialog(false);
+      return;
+    }
+
+    const saved = await saveInventory(inv);
+    if (saved) {
+      const dest = pendingExitDestinationRef.current;
+      setShowExitDraftDialog(false);
+      setHighlightRequiredFields(false);
+      setCurrentInventory(null);
+      setSignatures({ owner: '', tenant: '' });
+      executeExitNavigation(dest);
+    }
+  };
+
+  const handleDiscardDraftFromExitDialog = async () => {
+    if (!currentInventoryRef.current) {
+      setShowExitDraftDialog(false);
+      return;
+    }
+    const invId = currentInventoryRef.current.id;
+    try {
+      await deletePhotosByInventory(invId);
+    } catch (e) {
+      console.warn('Error eliminando fotografías al descartar borrador:', e);
+    }
+
+    setPendingLocalPhotos(prev => prev.filter(p => p.inventoryId !== invId));
+    setGlobalPendingPhotos(prev => prev.filter(p => p.inventoryId !== invId));
+    setOrphanPhotoGroups(prev => prev.filter(g => g.inventoryId !== invId));
+
+    const dest = pendingExitDestinationRef.current;
+    setShowExitDraftDialog(false);
+    setHighlightRequiredFields(false);
     setCurrentInventory(null);
     setSignatures({ owner: '', tenant: '' });
-    navigateTo('list');
+    executeExitNavigation(dest);
+    showNotify('Borrador no guardado descartado', 'info');
+  };
+
+  const handleGoHome = async () => {
+    if (view === 'list') return;
+    await requestExit('home');
   };
 
   const handleBack = async () => {
-    if (view === 'create' && currentInventory && currentInventory.status === 'draft') {
-      // Check if it's essentially empty
-      const isBasicallyEmpty = !currentInventory.propertyName.trim() && 
-                              !currentInventory.address.trim() && 
-                              !currentInventory.ownerName?.trim() && 
-                              !currentInventory.tenantName?.trim() &&
-                              !currentInventory.internalCode?.trim();
-      
-      // Only auto-save if it has the mandatory fields (property name and address)
-      if (!isBasicallyEmpty && currentInventory.propertyName.trim() && currentInventory.address.trim()) {
-        const saved = await saveInventory(currentInventory);
-        if (!saved) {
-          showNotify('No se pudo guardar el borrador. Revisa tu conexión.', 'error');
-          return; // Stay on the page if save fails
-        }
-      }
-    }
-
-    if (window.history.state && window.history.state.view !== 'list') {
-      window.history.back();
-    } else {
-      setView('list');
-      setCurrentInventory(null);
-      setSignatures({ owner: '', tenant: '' });
-    }
+    await requestExit('back');
   };
 
   const applyTemplate = (type: string) => {
@@ -8945,13 +9175,28 @@ export default function App() {
 
                 <div className="grid sm:grid-cols-2 gap-6">
                   <div className="space-y-2">
-                    <label className="text-xs font-bold uppercase tracking-widest text-muted">Nombre del Inmueble</label>
+                    <label className="text-xs font-bold uppercase tracking-widest text-muted flex items-center justify-between">
+                      <span>Nombre del Inmueble *</span>
+                      {highlightRequiredFields && !currentInventory.propertyName?.trim() && (
+                        <span className="text-[10px] text-amber-600 font-bold lowercase">requerido</span>
+                      )}
+                    </label>
                     <input 
                       type="text"
                       value={currentInventory.propertyName}
-                      onChange={(e) => setCurrentInventory({...currentInventory, propertyName: e.target.value})}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setCurrentInventory({...currentInventory, propertyName: val});
+                        if (highlightRequiredFields && val.trim() && currentInventory.address?.trim()) {
+                          setHighlightRequiredFields(false);
+                        }
+                      }}
                       placeholder="Ej: Apartamento 402 - Edificio Sol"
-                      className="w-full bg-[#f8f9fa] border border-black/5 rounded-xl px-4 py-3 focus:ring-2 focus:ring-black outline-none transition-all"
+                      className={`w-full bg-[#f8f9fa] border rounded-xl px-4 py-3 outline-none transition-all ${
+                        highlightRequiredFields && !currentInventory.propertyName?.trim()
+                          ? 'border-amber-500 ring-2 ring-amber-400/50 bg-amber-50/40'
+                          : 'border-black/5 focus:ring-2 focus:ring-black'
+                      }`}
                     />
                   </div>
                   <div className="space-y-2">
@@ -8999,13 +9244,28 @@ export default function App() {
                     />
                   </div>
                   <div className="space-y-2">
-                    <label className="text-xs font-bold uppercase tracking-widest text-muted">Dirección</label>
+                    <label className="text-xs font-bold uppercase tracking-widest text-muted flex items-center justify-between">
+                      <span>Dirección *</span>
+                      {highlightRequiredFields && !currentInventory.address?.trim() && (
+                        <span className="text-[10px] text-amber-600 font-bold lowercase">requerido</span>
+                      )}
+                    </label>
                     <input 
                       type="text"
                       value={currentInventory.address}
-                      onChange={(e) => setCurrentInventory({...currentInventory, address: e.target.value})}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setCurrentInventory({...currentInventory, address: val});
+                        if (highlightRequiredFields && val.trim() && currentInventory.propertyName?.trim()) {
+                          setHighlightRequiredFields(false);
+                        }
+                      }}
                       placeholder="Calle 123 # 45 - 67"
-                      className="w-full bg-[#f8f9fa] border border-black/5 rounded-xl px-4 py-3 focus:ring-2 focus:ring-black outline-none transition-all"
+                      className={`w-full bg-[#f8f9fa] border rounded-xl px-4 py-3 outline-none transition-all ${
+                        highlightRequiredFields && !currentInventory.address?.trim()
+                          ? 'border-amber-500 ring-2 ring-amber-400/50 bg-amber-50/40'
+                          : 'border-black/5 focus:ring-2 focus:ring-black'
+                      }`}
                     />
                   </div>
                   <div className="space-y-2">
@@ -9926,6 +10186,8 @@ export default function App() {
         lastAttemptTimestamp={lastSyncAttemptTimestamp}
         hasFirestoreQuotaError={isFirestoreQuotaActive}
         hasStorageQuotaError={isStorageQuotaActive}
+        orphanPhotoGroups={orphanPhotoGroups}
+        onDiscardOrphanGroup={handleDiscardOrphanGroup}
         onRetryNow={async () => {
           setIsRetryingSync(true);
           try {
@@ -9940,6 +10202,15 @@ export default function App() {
           showNotify(`${globalPendingPhotos.length} fotos pendientes de subir. Se subirán cuando abras la app con conexión.`, 'info');
         }}
         isRetrying={isRetryingSync}
+      />
+
+      {/* Diálogo de confirmación para prevenir fotos huérfanas al salir de borrador sin guardar */}
+      <ExitDraftDialog
+        isOpen={showExitDraftDialog}
+        photoCount={exitDraftPhotoCount}
+        onContinueEditing={handleContinueEditing}
+        onSaveDraft={handleSaveDraftFromExitDialog}
+        onDiscard={handleDiscardDraftFromExitDialog}
       />
 
       {/* In-App Continuous Shutter Camera */}

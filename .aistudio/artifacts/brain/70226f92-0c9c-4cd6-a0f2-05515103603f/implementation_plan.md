@@ -1,158 +1,134 @@
-# Plan de Corrección: Cámara Continua In-App (ContinuousCamera)
+# Plan de Implementación: Prevención y Limpieza de Fotos Huérfanas
 
-Este plan detalla la arquitectura y corrección para garantizar una cámara continua de **un toque = una foto** (sin ráfagas automáticas), con componentes desacoplados, callbacks estables, gestión blindada del historial en Android y control fiable de gestos táctiles y hardware.
-
----
-
-## 1. Diagnóstico de la Causa Raíz
-
-1. **Re-renderizados y Reinicio Constante del Stream**:
-   - En `src/App.tsx`, las funciones pasadas como props a `<ContinuousCamera />` (`onCapturePhoto`, `onClose`, etc.) se generaban como funciones flecha anónimas en línea.
-   - Cada render de `App` (provocado por timers, listeners de cuota, o por la actualización de `currentInventory` al guardar fotos) recreaba estas referencias.
-   - En `ContinuousCamera.tsx`, el `useEffect` que inicializaba la cámara dependía de `startCamera` y `stopTracks`, que a su vez dependían de `stream` y de las props de `App`. Esto provocaba que el componente reiniciara el stream o vaciara `sessionPhotos` a `[]` en cada render.
-2. **Dependencia errónea de `targetSpaceId` global**:
-   - El manejador tradicional `handlePhotoCapture` ejecutaba `setTargetSpaceId(null)` tras la primera foto, dejando sin destino a capturas subsiguientes si se dependía del estado global en vez de la prop inmutable del modal.
-3. **Falta de Validación Previa de Video / Canvas**:
-   - Si se disparaba antes de que `video.readyState >= 2` o con `videoWidth === 0`, el canvas no dibujaba nada o `canvas.toBlob` generaba un blob nulo o de 0 bytes, fallando silenciosamente tras haber mostrado el destello.
-4. **Desconexión entre el Destello y el Guardado Real**:
-   - La retroalimentación visual no debe asumir éxito; el incremento del contador y la miniatura deben actualizarse únicamente cuando `addPhotosToTarget` resuelva de manera exitosa en IndexedDB.
+Este plan detalla la arquitectura para evitar que queden fotografías huérfanas en la cola local de sincronización (`offlinePhotoDb`) cuando un usuario sale de un inventario nuevo sin haberlo guardado, protegiendo tanto la navegación por botones de la interfaz como el botón físico/gesto "Atrás" de Android, e incorporando un módulo de limpieza manual para fotos huérfanas existentes.
 
 ---
 
-## 2. Decisiones de Arquitectura y Ajustes Aprobados
+## 1. Situación Actual y Causa Raíz
+
+1. **Salida sin Guardar en `handleBack` y `handleGoHome`**:
+   - Si un inventario está en modo borrador pero aún no cuenta con `propertyName` y `address` (campos mínimos requeridos para crear el documento), las funciones limpian `currentInventory = null` y navegan a la lista sin eliminar los registros creados en `photo_sync_queue` de IndexedDB.
+   - Las fotos tomadas durante esa sesión continúan en la cola local de subida de forma permanente.
+2. **Botón Atrás de Android (`handlePopState`)**:
+   - Si el usuario presiona "Atrás" en Android mientras está en `view === 'create'`, el listener actual simplemente ejecuta `setView('list')`, sin validar si hay cambios sin guardar, sin invocar `handleBack` y sin limpiar las fotos pendientes.
+3. **Fotos Huérfanas Acumuladas**:
+   - En dispositivos donde ya se descartaron inventarios incompletos en el pasado, los blobs siguen ocupando espacio en IndexedDB y el Sync Engine intenta procesarlos periódicamente.
+
+---
+
+## 2. Decisiones de Arquitectura y Flujos
 
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│                                App.tsx                                 │
-│  - Callbacks estables (useCallback) para todas las operaciones         │
-│  - Destino inmutable pasado como prop: { type, spaceId, capturedAt }   │
-│  - handlePopState global ignora el evento si continuousCamera está     │
-│    abierta, previniendo navegación no deseada a 'list'                 │
-│  - Pausa de PhotoSyncEngine con 4 salvaguardas de reanudación          │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │ Props estables + React.memo
-                                    ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│                     ContinuousCamera (Componente Memo)                 │
-│  - Stream useEffect depende ÚNICAMENTE de isOpen                       │
-│  - closeCamera() unificado: consume entrada de historial con           │
-│    history.back() en Listo, X, fallback, error o botón Atrás           │
-│  - Watchdog de 4 s arranca SOLO cuando getUserMedia resuelve (permiso  │
-│    concedido), no durante el diálogo nativo de permisos                │
-│  - Pantalla interna de fallback con botón táctil directo ("Abrir       │
-│    cámara del sistema") para evitar bloqueo de gestos del navegador    │
-│  - Timestamp exacto del instante del disparo (capturedAt = Date.now()) │
-│  - Captura Canvas por defecto con validación estricta de blob          │
-│  - Shutter: valida video.readyState >= 2 & width > 0 antes de destello │
-│  - Contador y miniatura SOLO tras persistencia exitosa                 │
-│  - HUD de diagnóstico con toque sostenido (600ms) en contador          │
-│  - Wake Lock de pantalla activo mientras esté abierta                  │
-└────────────────────────────────────────────────────────────────────────┘
+                                    Usuario pulsa Atrás / Inicio / PopState
+                                                      │
+                                                      ▼
+                                       ┌─────────────────────────────┐
+                                       │    requestExit(destino)     │
+                                       └──────────────┬──────────────┘
+                                                      │
+                                    ¿view === 'create' y borrador?
+                                      /                            \
+                                   (NO)                            (SÍ)
+                                   /                                  \
+                     Navegar directo al destino             ¿Tiene trabajo ingresado?
+                                                            (fotos o campos de texto)
+                                                               /                   \
+                                                            (NO)                   (SÍ)
+                                                            /                         \
+                                             deletePhotosByInventory(id)    ¿Tiene nombre y dirección?
+                                             y salir en silencio              /                    \
+                                                                            (SÍ)                   (NO)
+                                                                            /                         \
+                                                                  Guardar borrador            Mostrar diálogo
+                                                                  y salir al destino         ExitDraftDialog
+                                                                                             ┌───────────────┐
+                                                                                             │- Seguir       │
+                                                                                             │- Guardar      │
+                                                                                             │- Descartar    │
+                                                                                             └───────────────┘
 ```
 
 ---
 
-## 3. Especificación Técnica Detallada de Cambios
+## 3. Especificación Técnica de los Cambios
 
-### 1. Gestión Unificada de Historial y `closeCamera()`
-- **Apertura de Cámara**:
-  ```ts
-  window.history.pushState({ view: view, continuousCamera: true }, '');
-  cameraHistoryEntryPushedRef.current = true;
-  ```
-- **Cierre Unificado (`closeCamera`)**:
-  - Función centralizada invocada por todas las vías de salida: botón "Listo", botón "X", pantalla de error/fallback o botón físico/gesto "Atrás".
-  - Si la entrada superior en el historial es la de la cámara (`cameraHistoryEntryPushedRef.current` o `window.history.state?.continuousCamera`), ejecuta `window.history.back()`.
-  - Desactiva el flag para no duplicar retrocesos.
-- **Protección en `handlePopState` Global de `App.tsx`**:
-  ```ts
-  const handlePopState = (event: PopStateEvent) => {
-    // Si la cámara continua está abierta, el evento le pertenece y no debe alterar la vista del inventario
-    if (continuousCamera.open) {
-      return;
-    }
-    if (event.state && event.state.view) {
-      setView(event.state.view);
-    } else {
-      setView('list');
-    }
-  };
-  ```
+### 3.1 Función Única `requestExit(destino: 'home' | 'back' | 'popstate')`
+Se centraliza la lógica de salida en `src/App.tsx`:
+1. **Detección de Inventario No Guardado**:
+   - Se considera no guardado si `currentInventory.id` no existe en la lista en memoria `inventories` (que incluye tanto inventarios de Firestore como borradores guardados localmente) y no está en proceso de guardado activo.
+2. **Evaluación de Trabajo Ingresado (`hasWork`)**:
+   - **Fotos**: `getPendingPhotosByInventory(id).length > 0` o fotos presentes en memoria en los espacios o anexos (`spaces.some(s => s.photos.length > 0)` o `annexPhotos.length > 0`).
+   - **Campos de Texto**: contenido no vacío en `propertyName`, `address`, `ownerName`, `tenantName`, `internalCode`, `generalObservations`, o descripciones/detalles de los ítems de los espacios.
+3. **Casos de Decisión**:
+   - **Caso 1: Sin trabajo (`!hasWork`)**:
+     - Ejecuta `await deletePhotosByInventory(currentInventory.id)` para limpiar cualquier posible residuo en IndexedDB.
+     - Limpia `currentInventory = null`, firmas y estados temporales.
+     - Navega en silencio al destino.
+   - **Caso 2: Con trabajo y campos obligatorios completos (`propertyName` y `address`)**:
+     - Mantiene el comportamiento actual: guarda el borrador con `await saveInventory(currentInventory)` y navega. Las fotos quedan asociadas al borrador y continúan su subida normal.
+   - **Caso 3: Con trabajo pero faltan nombre o dirección**:
+     - Detiene la salida y abre `ExitDraftDialog`.
+     - Si la llamada provino de `handlePopState`, restaura de inmediato la entrada en el historial con `window.history.pushState({ view: 'create' }, '')` para que el navegador no saque al usuario de la pantalla.
 
-### 2. Pantalla de Fallback Interactiva (Sin llamadas automáticas a `.click()`)
-- Los navegadores y WebViews de Android bloquean `.click()` sobre inputs de archivo cuando provienen de temporizadores (`setTimeout`) o callbacks asíncronos de error.
-- En caso de error de `getUserMedia` (permiso denegado, dispositivo ocupado) o expiración del watchdog de video:
-  - Cierra de inmediato los tracks del stream.
-  - Renderiza una pantalla de fallback interna dentro de `ContinuousCamera`:
-    - Icono de aviso y mensaje explicativo del motivo del error.
-    - Botón primario prominente: **"Abrir cámara del sistema"** (su evento táctil `onClick` invoca de forma síncrona `onOpenSystemCamera()`).
-    - Botón secundario: **"Abrir Galería"** (invoca síncronamente `onOpenGallery()`).
-    - Botón de cancelación / volver al inventario.
+### 3.2 Componente `ExitDraftDialog` (`src/components/ExitDraftDialog.tsx`)
+Nuevo modal de confirmación con diseño limpio y accesible:
+- **Mensaje**:
+  - *"Este inventario aún no se ha guardado. Si sales ahora perderás {N fotos y} los datos ingresados."* (calcula dinámicamente si hay fotos y pluraliza: *"1 foto y"*, *"3 fotos y"*, o solo *"los datos ingresados"* si no hay fotos).
+- **Acciones**:
+  1. **"Seguir editando"** (botón principal destacado):
+     - Cierra el diálogo y mantiene al usuario en el editor del inventario sin alterar el estado.
+  2. **"Guardar borrador"**:
+     - Si faltan `propertyName` o `address`: no sale, cierra el diálogo (o muestra toast), hace scroll al inicio del formulario y resalta los campos con borde de atención y el mensaje *"Completa nombre y dirección para guardar"*.
+     - Si están completos: ejecuta `saveInventory(currentInventory)` y navega al destino pendiente.
+  3. **"Descartar"** (botón rojo / destructivo):
+     - Ejecuta `await deletePhotosByInventory(currentInventory.id)`.
+     - Actualiza `pendingLocalPhotos` y `globalPendingPhotos` eliminando las fotos del inventario descartado.
+     - Limpia `currentInventory = null`, firmas y URLs de miniaturas.
+     - Muestra toast: *"Inventario descartado"*.
+     - Navega a la lista (`navigateTo('list')`).
 
-### 3. Watchdog de 4 Segundos tras Concesión de Permiso
-- El watchdog **NO** se inicia al abrir el modal, protegiendo el tiempo que el usuario tarda en aceptar el diálogo nativo de permisos de Android/navegador.
-- **Inicio**: Arranca exactamente cuando `navigator.mediaDevices.getUserMedia(...)` resuelve exitosamente la promesa.
-- **Evaluación**: Si tras 4.000 ms desde la resolución el elemento `<video>` no ha alcanzado `readyState >= 2` y `videoWidth > 0`, cancela el stream y activa la pantalla interna de fallback.
+### 3.3 Intercepción del Botón Atrás de Android (`handlePopState`)
+- Se actualiza `handlePopState` en `src/App.tsx`:
+  - Si la cámara continua está abierta (`continuousCameraOpenRef.current`), la cámara consume el evento (comportamiento actual preservado).
+  - Si `view === 'create'`:
+    - Evalúa si el inventario actual requiere confirmación.
+    - Si requiere confirmación, ejecuta `window.history.pushState({ view: 'create' }, '')` y abre el diálogo.
+    - Si no requiere confirmación (no hay trabajo o ya estaba guardado), procede con la salida limpia.
 
-### 4. Pausa Blindada de Subida de Fotos (`PhotoSyncEngine`)
-- Mientras la cámara esté abierta, se suspende la subida de fotos a Firebase (`photoSyncEngine.pause()`) para liberar el 100% de CPU, RAM y bus de datos en favor de la captura.
-- **Garantía absoluta de reanudación (`photoSyncEngine.resume()`) en 4 salvaguardas**:
-  1. En la función `closeCamera()` al cerrar la cámara.
-  2. En la función de limpieza (`cleanup`) del `useEffect` al desmontar el componente.
-  3. En el listener de ciclo de vida cuando la app pasa a segundo plano (`document.visibilityState === 'hidden'`).
-  4. **Seguro por tiempo límite (Watchdog de 15 minutos)**: Un temporizador `setTimeout` de 900.000 ms que ejecuta `photoSyncEngine.resume()` incondicionalmente, garantizando que nunca quede pausada de manera permanente.
-
-### 5. Timestamp Fidedigno del Instante del Disparo
-- Al presionar el obturador táctil, se captura de inmediato:
-  ```ts
-  const capturedAt = Date.now();
-  ```
-- Este timestamp se envía junto con el archivo a través del flujo unificado:
-  ```ts
-  addPhotosToTarget(files, { type, spaceId, capturedAt })
-  ```
-- `uploadPhotoWithFallback` asigna `capturedAt` como el `timestamp` oficial de la foto (en lugar del momento en que finaliza la compresión o el guardado en IndexedDB).
-
-### 6. Shutter, Cola y Retroalimentación Fidedigna
-- **Validación previa al disparo**:
-  ```ts
-  if (!video || video.readyState < 2 || video.videoWidth === 0) {
-    showToast('La cámara aún no está lista', 'warning');
-    return;
-  }
-  if (captureQueueRef.current.length >= 20) {
-    showToast('Cola llena (máx. 20 fotos). Espera a que se guarden las pendientes.', 'warning');
-    return;
-  }
-  ```
-- **Captura Canvas**:
-  - Dibuja el fotograma en canvas según `video.videoWidth` y `video.videoHeight`.
-  - Verifica que `canvas.toBlob` entregue un blob válido y con tamaño mayor a 0 bytes.
-  - Ejecuta el destello visual de pantalla (`setIsFlashing(true)`) y la vibración háptica (`navigator.vibrate(15)`).
-- **Contador y Miniatura**:
-  - No se incrementan por adelantado.
-  - Se actualizan **únicamente** cuando `onCapturePhoto` resuelve con éxito con la foto guardada en IndexedDB.
-  - Si ocurre un fallo en el guardado, se presenta un toast de error con el detalle y no sube el contador.
-
-### 7. Panel de Diagnóstico HUD (Toque Largo)
-- Pulsación sostenida de 600 ms sobre el encabezado del contador muestra un panel técnico superpuesto con:
-  - Estado del stream: `"iniciando"` | `"lista"` | `"error: <nombre>"`.
-  - Resolución del sensor: `${videoWidth}x${videoHeight}`.
-  - Conteo de sesión: `{guardadas}` / `{intentadas}`.
-  - Longitud de cola en espera.
-  - Último error registrado.
+### 3.4 Limpieza de Fotos Huérfanas Existentes en `SyncStatusSheet`
+- En `SyncStatusSheet.tsx` (y lógica de detección en `src/App.tsx` o helper dedicado):
+  - Analiza `globalPendingPhotos`.
+  - Agrupa las fotos pendientes por `inventoryId`.
+  - Excluye el inventario actualmente abierto en edición.
+  - Comprueba contra la lista local `inventories`. Si no existe localmente y la app está en línea, valida mediante `getDoc(doc(db, 'inventories', invId))` si el inventario existe en Firestore.
+  - Aquellos grupos cuyo inventario no exista ni en local ni en la nube se catalogan como **"Fotos sin inventario"**.
+- **Interfaz en `SyncStatusSheet`**:
+  - Sección *"Fotos sin inventario"* con advertencia informativa.
+  - Para cada grupo huérfano muestra:
+    - Cantidad de fotos (ej. *"3 fotos huérfanas"*).
+    - Antigüedad (ej. *"Tomadas hace 2 días"* o fecha formateada).
+    - Botón **"Descartar"** con icono de papelera.
+  - Al pulsar "Descartar", solicita confirmación con diálogo breve y, al aceptar, ejecuta `deletePhotosByInventory(invId)` y refresca el contador de la cola.
+  - **Regla estricta**: Ninguna foto huérfana se borra de manera automática sin la acción expresa del usuario.
 
 ---
 
-## 4. Criterios de Aceptación y Verificación
+## 4. Archivos a Modificar / Crear
 
-1. **Un toque = Una foto**: Tocar el obturador captura una sola foto por toque; la cámara permanece abierta y lista para el siguiente disparo sin disparos automáticos.
-2. **Estabilidad del Stream**: El visor de video no parpadea ni se reinicia al guardar una foto ni ante renders externos en `App.tsx`.
-3. **Persistencia Fidedigna**: El contador y la miniatura solo se actualizan cuando la foto se guarda efectivamente en el espacio o anexo correspondiente.
-4. **Navegación e Historial en Android**:
-   - Presionar "Atrás" en Android mientras la cámara continua está abierta cierra **única y exclusivamente la cámara continua**.
-   - Cerrar la cámara por cualquier vía (Listo, X, Atrás o Fallback) y posteriormente presionar "Atrás" regresa al listado o vista anterior según el flujo normal, sin salir del inventario ni desfasar la navegación.
-5. **Fallback sin Bloqueo de Gestos**: Si el permiso falla o el watchdog expira, muestra botones táctiles directos que abren la cámara del sistema o la galería sin ser bloqueados por el navegador.
-6. **Watchdog Condicionado**: El tiempo de espera de 4 s no penaliza el diálogo de permisos del sistema operativo.
-7. **Reanudación Garantizada del Sync Engine**: La subida de fotos se reanuda al cerrar, al minimizar, al desmontar o tras 15 minutos de inactividad.
-8. **Compilación y Linteo**: `compile_applet` y `lint_applet` limpios con 0 errores, y validación correcta con `android-patch.py`.
+| Archivo | Cambios Planificados |
+| :--- | :--- |
+| `src/components/ExitDraftDialog.tsx` *(Nuevo)* | Componente modal con diseño accesible para confirmar salida de borrador no guardado (Seguir editando, Guardar borrador, Descartar). |
+| `src/App.tsx` | - Implementar `requestExit(destino)`.<br>- Actualizar `handleBack`, `handleGoHome` y `handlePopState` para invocar `requestExit`.<br>- Renderizar `ExitDraftDialog`.<br>- Proveer lógica de detección y descarte de fotos huérfanas para `SyncStatusSheet`. |
+| `src/components/SyncStatusSheet.tsx` | Añadir sección visual de "Fotos sin inventario" con lista de grupos huérfanos y botón interactivo de descarte por confirmación. |
+
+---
+
+## 5. Criterios de Aceptación y Verificación
+
+1. **Inventario Vacío**: Crear inventario sin ingresar texto ni fotos y tocar Atrás o Home → Sale directamente a la lista sin diálogos ni errores.
+2. **Inventario con Fotos sin Nombre/Dirección**: Crear inventario, tomar 2 fotos, tocar botón Atrás/X → Se muestra `ExitDraftDialog` con el aviso *"perderás 2 fotos y los datos ingresados"*.
+3. **Acción Descartar**: Al pulsar "Descartar", `deletePhotosByInventory` elimina las 2 fotos de IndexedDB; el contador de fotos pendientes en el encabezado queda en 0 y se regresa a la lista.
+4. **Acción Guardar Borrador**: Con fotos tomadas pero sin nombre/dirección, pulsar "Guardar borrador" no sale, resalta los campos obligatorios y muestra *"Completa nombre y dirección para guardar"*. Al completarlos y guardar, las fotos se conservan y se suben normalmente.
+5. **Botón Atrás de Android**: Presionar Atrás en el teléfono en un inventario con fotos sin guardar abre el mismo diálogo `ExitDraftDialog` sin salir del inventario.
+6. **No Interferencia con Cámara Continua**: Con la cámara continua abierta, presionar Atrás en Android sigue cerrando solo la cámara sin disparar el diálogo de borrador.
+7. **Limpieza Manual en SyncStatusSheet**: Las fotos huérfanas existentes en la base local aparecen agrupadas con su antigüedad y pueden ser descartadas manualmente tras confirmación.

@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   X, 
@@ -12,10 +12,17 @@ import {
   Images, 
   Database,
   CheckCircle2,
-  HardDrive
+  HardDrive,
+  Trash2
 } from 'lucide-react';
 import { format } from 'date-fns';
 import { es } from 'date-fns/locale';
+
+export interface OrphanPhotoGroup {
+  inventoryId: string;
+  count: number;
+  oldestTimestamp: number;
+}
 
 export interface SyncStatusSheetProps {
   isOpen: boolean;
@@ -31,6 +38,8 @@ export interface SyncStatusSheetProps {
   onRetryNow: () => void;
   onViewPendingPhotos: () => void;
   isRetrying?: boolean;
+  orphanPhotoGroups?: OrphanPhotoGroup[];
+  onDiscardOrphanGroup?: (inventoryId: string) => void;
 }
 
 export const SyncStatusSheet: React.FC<SyncStatusSheetProps> = ({
@@ -47,7 +56,11 @@ export const SyncStatusSheet: React.FC<SyncStatusSheetProps> = ({
   onRetryNow,
   onViewPendingPhotos,
   isRetrying = false,
+  orphanPhotoGroups = [],
+  onDiscardOrphanGroup,
 }) => {
+  const [confirmingOrphanId, setConfirmingOrphanId] = useState<string | null>(null);
+
   if (!isOpen) return null;
 
   const formattedLastAttempt = lastAttemptTimestamp
@@ -167,6 +180,79 @@ export const SyncStatusSheet: React.FC<SyncStatusSheetProps> = ({
                 : 'Tus fotos están resguardadas de manera segura.'}
             </p>
           </div>
+
+          {/* Fotos sin inventario (huérfanas) */}
+          {orphanPhotoGroups.length > 0 && (
+            <div className="bg-red-50/70 dark:bg-red-950/20 border border-red-200 dark:border-red-900/40 rounded-2xl p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-red-900 dark:text-red-200 font-bold text-xs uppercase tracking-wider">
+                  <Trash2 size={15} className="text-red-600" />
+                  <span>Fotos sin inventario</span>
+                </div>
+                <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-red-100 dark:bg-red-900/50 text-red-700 dark:text-red-300">
+                  {orphanPhotoGroups.reduce((acc, g) => acc + g.count, 0)} fotos
+                </span>
+              </div>
+              <p className="text-xs text-red-800/80 dark:text-red-300/80 leading-relaxed">
+                Fotografías en cola de inventarios descartados o que no existen en la base de datos.
+              </p>
+              <div className="space-y-2 pt-1">
+                {orphanPhotoGroups.map((group) => {
+                  const dateStr = format(new Date(group.oldestTimestamp), 'dd/MM/yyyy HH:mm', { locale: es });
+                  const isConfirming = confirmingOrphanId === group.inventoryId;
+
+                  return (
+                    <div 
+                      key={group.inventoryId}
+                      className="bg-white dark:bg-neutral-900 border border-red-100 dark:border-red-900/30 rounded-xl p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 shadow-xs"
+                    >
+                      <div>
+                        <p className="text-xs font-bold text-black dark:text-white">
+                          {group.count} {group.count === 1 ? 'foto huérfana' : 'fotos huérfanas'}
+                        </p>
+                        <p className="text-[10px] text-muted">
+                          Tomadas el {dateStr}
+                        </p>
+                      </div>
+
+                      {isConfirming ? (
+                        <div className="flex items-center gap-1.5 self-end sm:self-auto">
+                          <button
+                            type="button"
+                            onClick={() => setConfirmingOrphanId(null)}
+                            className="px-2.5 py-1 text-[11px] font-semibold text-muted hover:text-black dark:hover:text-white rounded-lg hover:bg-black/5 dark:hover:bg-white/5 transition-colors cursor-pointer"
+                          >
+                            Cancelar
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (onDiscardOrphanGroup) {
+                                onDiscardOrphanGroup(group.inventoryId);
+                              }
+                              setConfirmingOrphanId(null);
+                            }}
+                            className="px-2.5 py-1 text-[11px] font-bold bg-red-600 hover:bg-red-700 text-white rounded-lg shadow-xs transition-colors cursor-pointer"
+                          >
+                            Confirmar descarte
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => setConfirmingOrphanId(group.inventoryId)}
+                          className="self-end sm:self-auto px-2.5 py-1 text-[11px] font-bold text-red-600 dark:text-red-400 hover:bg-red-100/60 dark:hover:bg-red-900/30 rounded-lg transition-colors flex items-center gap-1 cursor-pointer"
+                        >
+                          <Trash2 size={12} />
+                          <span>Descartar</span>
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
 
           {/* Último Error (si existe) */}
           {resolvedError && (

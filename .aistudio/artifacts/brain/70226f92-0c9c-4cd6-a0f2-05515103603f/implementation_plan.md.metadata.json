@@ -1,6 +1,6 @@
 {
-  "summary":  "Plan de corrección definitivo para la cámara continua con código detallado de arquitectura: gestión centralizada de historial mediante closeCamera() y popstate protegido, vista interna de fallback con botones directos accionados por el usuario, watchdog de 4 segundos activado exclusivamente tras la resolución de getUserMedia, reanudación garantizada de photoSyncEngine en 4 salvaguardas (cierre, cleanup, segundo plano y timer de 15 min), captura de timestamp (capturedAt) en el milisegundo exacto del disparo y criterios de navegación de retorno en Android.",
-  "updatedAt":  "2026-10-28T19:15:52.346412098Z",
+  "summary":  "Plan de prevención y limpieza de fotografías huérfanas en inventarios no guardados: función centralizada requestExit(destino), diálogo de confirmación ExitDraftDialog, protección de navegación en Android Back (handlePopState), eliminación selectiva en IndexedDB con deletePhotosByInventory y sección de Fotos sin inventario en SyncStatusSheet.",
+  "updatedAt":  "2026-10-29T10:15:07.380350586Z",
   "requestFeedback":  true,
   "userFacing":  true
 }
