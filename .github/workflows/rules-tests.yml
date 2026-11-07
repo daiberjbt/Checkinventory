@@ -1,0 +1,61 @@
+name: Pruebas de reglas de seguridad
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'firestore.rules'
+      - 'storage.rules'
+      - 'rules.test.mjs'
+      - '.github/workflows/rules-tests.yml'
+
+jobs:
+  rules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Guardar en caché los emuladores
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/firebase/emulators
+          key: firebase-emulators-${{ runner.os }}-v1
+
+      - name: Instalar herramientas de prueba (aisladas de la app)
+        run: |
+          mkdir .rules-test
+          cd .rules-test
+          npm init -y > /dev/null
+          npm install --no-audit --no-fund @firebase/rules-unit-testing@6 firebase@13 firebase-tools@15
+          cp ../rules.test.mjs .
+          echo '{"firestore":{"rules":"../firestore.rules"},"storage":{"rules":"../storage.rules"},"emulators":{"firestore":{"port":8080},"storage":{"port":9199},"ui":{"enabled":false}}}' > firebase.json
+
+      - name: Ejecutar las pruebas
+        shell: bash
+        working-directory: .rules-test
+        env:
+          RULES_DIR: ..
+        run: |
+          npx firebase emulators:exec --non-interactive --project demo-checkinventory --only firestore,storage "node --test --test-reporter=spec rules.test.mjs" 2>&1 | tee ../rules-test-output.txt
+
+      - name: Mostrar el resumen en la página de la ejecución
+        if: always()
+        run: |
+          if [ -f rules-test-output.txt ]; then
+            {
+              echo '### Resumen de seguridad'
+              echo '```'
+              sed -n '/RESUMEN DE SEGURIDAD/,/^=====.*=====$/p' rules-test-output.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
