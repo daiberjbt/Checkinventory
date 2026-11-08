@@ -33,20 +33,18 @@ jobs:
 
       - name: Instalar herramientas de prueba (aisladas de la app)
         run: |
-          mkdir .rules-test
-          cd .rules-test
-          npm init -y > /dev/null
+          mkdir rules-test-env
+          cd rules-test-env
+          echo '{"name":"rules-tests","version":"1.0.0","private":true}' > package.json
           npm install --no-audit --no-fund @firebase/rules-unit-testing@6 firebase@13 firebase-tools@15
           cp ../rules.test.mjs .
-          echo '{"firestore":{"rules":"../firestore.rules"},"storage":{"rules":"../storage.rules"},"emulators":{"firestore":{"port":8080},"storage":{"port":9199},"ui":{"enabled":false}}}' > firebase.json
+          cd ..
+          echo '{"firestore":{"rules":"firestore.rules"},"storage":{"rules":"storage.rules"},"emulators":{"hub":{"host":"127.0.0.1"},"logging":{"host":"127.0.0.1"},"firestore":{"host":"127.0.0.1","port":8080},"storage":{"host":"127.0.0.1","port":9199},"ui":{"enabled":false}}}' > firebase.rules-test.json
 
       - name: Ejecutar las pruebas
         shell: bash
-        working-directory: .rules-test
-        env:
-          RULES_DIR: ..
         run: |
-          npx firebase emulators:exec --non-interactive --project demo-checkinventory --only firestore,storage "node --test --test-reporter=spec rules.test.mjs" 2>&1 | tee ../rules-test-output.txt
+          ./rules-test-env/node_modules/.bin/firebase emulators:exec --config firebase.rules-test.json --non-interactive --project demo-checkinventory --only firestore,storage "node --test --test-reporter=spec rules-test-env/rules.test.mjs" 2>&1 | tee rules-test-output.txt
 
       - name: Mostrar el resumen en la página de la ejecución
         if: always()
