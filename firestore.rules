@@ -33,6 +33,11 @@ service cloud.firestore {
                get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('isDeleted', false) != true));
     }
 
+    function myAgencyEmail() {
+      let me = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+      return me.get('role', 'admin') == 'admin' ? request.auth.token.email.lower() : me.get('adminEmail', '').lower();
+    }
+
     function isDependentOf(adminEmail) {
       return exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
              (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('adminEmail', '') == adminEmail ||
@@ -293,12 +298,7 @@ service cloud.firestore {
       allow create: if isAuthenticated() && 
                     isUserActive() &&
                     isValidInventory(request.resource.data) &&
-                    (
-                      isSuperAdmin() ||
-                      request.resource.data.createdBy == request.auth.uid ||
-                      request.auth.token.get('email', '') == request.resource.data.adminEmail ||
-                      isDependentOf(request.resource.data.adminEmail)
-                    );
+                    (isSuperAdmin() || request.resource.data.adminEmail.lower() == myAgencyEmail());
       
       // Update rule with Completed Document Lock (ALTO-04) and Tenant Guard
       allow update: if isAuthenticated() && 
@@ -310,6 +310,7 @@ service cloud.firestore {
                       isUserInSameAgency(resource.data.get('adminEmail', ''), resource.data.get('createdBy', ''))
                     ) &&
                     (assignmentUnchanged() || canManageAssignment()) &&
+                    (isSuperAdmin() || request.resource.data.adminEmail == resource.data.adminEmail) &&
                     (
                       isSuperAdmin() ||
                       // Draft inventories can be fully edited

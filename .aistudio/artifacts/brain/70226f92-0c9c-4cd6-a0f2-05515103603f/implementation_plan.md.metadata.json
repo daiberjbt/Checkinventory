@@ -1,6 +1,6 @@
 {
-  "summary":  "Plan de prevención y limpieza de fotografías huérfanas en inventarios no guardados: función centralizada requestExit(destino), diálogo de confirmación ExitDraftDialog, protección de navegación en Android Back (handlePopState), eliminación selectiva en IndexedDB con deletePhotosByInventory y sección de Fotos sin inventario en SyncStatusSheet.",
-  "updatedAt":  "2026-10-29T10:15:07.380350586Z",
+  "summary":  "Plan ajustado según la solicitud: se adopta exclusivamente la forma directa en allow create, se congela adminEmail en allow update sin alterar ningún archivo de src/, y se despliegan las reglas con confirmación.",
+  "updatedAt":  "2026-11-09T02:25:30.232821837Z",
   "requestFeedback":  true,
   "userFacing":  true
 }
