@@ -245,6 +245,15 @@ describe('Reglas de seguridad de CheckInventory', () => {
         await assertFails(db(ctxOf('adminB')).doc('inventories/inyectado').set(inv({ createdBy: 'adminB', adminEmail: EMAIL.adminA })));
       }
     );
+    ok('un dependiente cuyo perfil guarda el correo de su agencia con MAYÚSCULAS sigue pudiendo crear inventarios', async () => {
+      await testEnv.withSecurityRulesDisabled(async (ctx) => {
+        await db(ctx).doc('users/depA2').set(userDoc('depA2', { adminEmail: 'ADMIN-A@Test.com' }));
+      });
+      await assertSucceeds(db(ctxOf('depA2')).doc('inventories/mayus1').set(inv({ createdBy: 'depA2' })));
+    });
+    ok('el superadministrador puede crear un inventario para cualquier agencia', async () => {
+      await assertSucceeds(db(ctxOf('owner')).doc('inventories/deSuperadmin').set(inv({ createdBy: 'owner' })));
+    });
   });
 
   // ================================================================ INVENTARIOS: edición, firma y borrado
@@ -269,6 +278,13 @@ describe('Reglas de seguridad de CheckInventory', () => {
     ok('firmado: NO se puede cambiar la agencia (adminEmail)', async () => {
       await assertFails(db(ctxOf('depA1')).doc('inventories/invDoneA').update({ adminEmail: EMAIL.adminB }));
     });
+    hallazgo(
+      'borrador: NO se debe poder cambiar la agencia (adminEmail) de un inventario',
+      'Hoy solo está congelado en inventarios firmados; en borradores se puede cambiar y mover el dato a otra agencia.',
+      async () => {
+        await assertFails(db(ctxOf('depA1')).doc('inventories/invDraftA').update({ adminEmail: EMAIL.adminB }));
+      }
+    );
     ok('firmado: NO se puede volver a borrador', async () => {
       await assertFails(db(ctxOf('depA1')).doc('inventories/invDoneA').update({ status: 'draft' }));
     });
