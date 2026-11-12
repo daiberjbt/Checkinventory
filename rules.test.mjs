@@ -44,7 +44,7 @@ const ok = (name, fn) =>
       await fn();
       results.push({ kind: 'ok', name, passed: true });
     } catch (e) {
-      results.push({ kind: 'ok', name, passed: false, error: String(e?.message || e).split('\n')[0] });
+      results.push({ kind: 'ok', name, passed: false, error: String(e?.message || e).replace(/\s+/g, ' ').trim().slice(0, 600) });
       throw e;
     }
   });
@@ -526,6 +526,28 @@ describe('Reglas de seguridad de CheckInventory', () => {
     ok('el administrador asigna un inventario firmado a un dependiente de su agencia', async () => {
       await assertSucceeds(db(ctxOf('adminA')).doc('inventories/invDoneA').update(assignPayload('depA2', 'Dep A2')));
     });
+    hallazgo(
+      '[diagnóstico] el administrador puede editar campos normales de un inventario firmado',
+      'Si falla, el problema es general en la rama de administrador sobre inventarios firmados, no solo en asignar.',
+      async () => {
+        await assertSucceeds(db(ctxOf('adminA')).doc('inventories/invDoneA').update({ tenantReceiveText: 'Recibido' }));
+      }
+    );
+    hallazgo(
+      '[diagnóstico] el superadministrador puede asignar un inventario firmado',
+      'Si pasa y el administrador no, el camino del administrador es el que se queda sin margen (demasiadas condiciones).',
+      async () => {
+        await assertSucceeds(db(ctxOf('owner')).doc('inventories/invDoneA').update(assignPayload('depA2', 'Dep A2')));
+      }
+    );
+    hallazgo(
+      '[diagnóstico] el administrador asigna enviando solo los campos de asignación (sin isAssigned)',
+      'Aísla si la regla exige isAssigned o si el rechazo viene de otra condición.',
+      async () => {
+        const { isAssigned, ...sinIsAssigned } = assignPayload('depA2', 'Dep A2');
+        await assertSucceeds(db(ctxOf('adminA')).doc('inventories/invDoneA').update(sinIsAssigned));
+      }
+    );
     ok('un dependiente NO puede asignar inventarios', async () => {
       await assertFails(db(ctxOf('depA1')).doc('inventories/invDoneA').update(assignPayload('depA2', 'Dep A2')));
     });
